@@ -205,7 +205,15 @@ fn feed(decoder: Decoder&, input: const u8[:], out: u8[>..]&) -> Error {
         // A zero budget still needs one byte of room so that a stream which
         // produces nothing can end; a byte that arrives is then over budget.
         let remaining = decoder.limits.output_bytes - decoder.progress.produced;
-        let step = min(chunk_bytes(), max(min_step_bytes(), decoder.progress.produced));
+        // The first step is small so a tiny stream does not pay for a 64 KiB
+        // zero-fill it will never use. After that the step is the full chunk:
+        // growing it gradually costs one inflate call and one resize per
+        // doubling, which is measurable on a 64 KiB stream and buys nothing.
+        let step = if decoder.progress.produced == 0 {
+            min_step_bytes()
+        } else {
+            chunk_bytes()
+        };
         let reserve = min(max(remaining, 1), step);
         out.resize(out.len + reserve, 0);
         let base = out.len - reserve;
