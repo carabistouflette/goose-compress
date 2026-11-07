@@ -128,8 +128,13 @@ bench-parity: bench-build
 bench-plan: bench-build
 	python3 bench/runner.py --plan
 
+# `bench-run` always takes an exclusive lock, because a measurement is only
+# meaningful if no other CPU job is running. Override BENCH_LOCK to share one
+# lock file with the other jobs on the machine; set BENCH_LOCK= to opt out.
+BENCH_LOCK ?= /tmp/goose-compress-bench.lock
 bench-run: bench-build
 	python3 bench/runner.py --goose "$(GOOSE)" --cc $(BENCH_CC) \
+		$(if $(BENCH_LOCK),--lock-file "$(BENCH_LOCK)",) \
 		--output .build/benchmark.json
 
 # Freezes the identity of the tree before the runtime is touched. Each variant
