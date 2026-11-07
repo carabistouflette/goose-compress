@@ -35,6 +35,11 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BUILD = ROOT / ".build"
 INPUTS = BUILD / "bench-inputs"
+# The published baseline binary, kept immutable. The before/after is measured
+# against this file, not against a rebuild of the old sources, so that the old
+# identity cannot drift while the new one is being changed.
+BASELINE_BENCH = BUILD / "baseline" / "archive" / "c99b049-v6" / "variants" / \
+    "release" / "bench"
 
 sys.path.insert(0, str(ROOT / "bench"))
 import measure  # noqa: E402  (prepare, provenance, fnv1a, SIZES, ITERATIONS)
@@ -89,6 +94,52 @@ HARNESSES = [
         "role": "the same zlib under the same framing policy: overhead, not a ranking",
     },
     {
+        "label": "zlib-ng bounded (same contract)",
+        "binary": "zlib-ng-bounded",
+        "mode": None,
+        "contract": "bounded: output budget, input budget, 1 member, trailing rejected",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the same framing policy on a different zlib backend",
+    },
+    {
+        "label": "zlib 1.4 bounded (same contract)",
+        "binary": "zlib14-bounded",
+        "mode": None,
+        "contract": "bounded: output budget, input budget, 1 member, trailing rejected",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the same framing policy on zlib 1.4, built static here",
+    },
+    {
+        "label": "goose-compress baseline c99b049 oneshot",
+        "path": str(BASELINE_BENCH),
+        "mode": "oneshot",
+        "contract": "bounded: output budget, input budget, 1 member, trailing rejected",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the published baseline binary, unchanged, for the before/after",
+    },
+    {
+        "label": "goose-compress baseline c99b049 stream",
+        "path": str(BASELINE_BENCH),
+        "mode": "stream",
+        "contract": "bounded: same limits, 64 KiB steps",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the published baseline binary, unchanged, for the before/after",
+    },
+    {
+        "label": "goose-deflate whole buffer (no bounds)",
+        "binary": "goose-deflate-bench",
+        "mode": None,
+        "contract": "unbounded: whole member, no output budget, no input budget, "
+                    "no member or trailing policy, bool result",
+        "buffer": "allocated inside every call",
+        "comparable": False,
+        "role": "the other Goose decoder, at its own scope; never a ranking",
+    },
+    {
         "label": "zlib oneshot (no bounds)",
         "binary": "zlib-oneshot",
         "mode": None,
@@ -98,17 +149,25 @@ HARNESSES = [
         "role": "overhead baseline only; looser contract, never a ranking",
     },
     {
-        "label": "libdeflate oneshot (no bounds)",
+        "label": "libdeflate oneshot (bounded buffer)",
         "binary": "libdeflate-oneshot",
         "mode": None,
-        "contract": "unbounded: no output budget, no input budget, no trailing check",
+        "contract": "bounded one-shot: out_nbytes_avail is the output budget, "
+                    "input budget is a length check, one member, trailing "
+                    "rejected via actual_in_nbytes; no cumulative budget, no "
+                    "member policy, no dictionary, no checksum/malformed split",
         "buffer": "reused across calls",
-        "comparable": False,
-        "role": "throughput reference only; one-shot, so it does not rank streaming",
+        "comparable": True,
+        "role": "a different decoder at the one-shot bounded contract; it does "
+                "not rank the streaming rows",
     },
 ]
 
-BINARIES = ["bench", "zlib-bounded", "zlib-oneshot", "libdeflate-oneshot"]
+BINARIES = ["bench", "zlib-bounded", "zlib-ng-bounded", "zlib14-bounded",
+            "zlib-oneshot", "libdeflate-oneshot", "goose-deflate-bench"]
+# Rows whose binary is fetched or built by an opt-in target. Their absence is a
+# skipped row, not a broken run.
+OPTIONAL_BINARIES = {"goose-deflate-bench", "zlib14-bounded"}
 INVALID_HARNESS = {
     "label": "goose-compress invalid",
     "binary": "bench",
@@ -131,6 +190,11 @@ SOURCE_FILES = [
     "bench/compare/zlib_bounded.c",
     "bench/compare/zlib_oneshot.c",
     "bench/compare/libdeflate_oneshot.c",
+    "bench/compare/goose_deflate_bench.goose",
+    "bench/compare/goose_probe.goose",
+    "bench/compare/contract_parity.py",
+    "bench/compare/zlib_ng_shim.h",
+    "tests/concurrency.c",
 ]
 
 
@@ -583,6 +647,11 @@ def snapshot(goose_path, cc, affinity_allowed, affinity_cpu):
         "source_sha256": source_hashes,
         "binaries": {name: sha256_file(BUILD / name)
                      for name in BINARIES if (BUILD / name).is_file()},
+        "baseline_binary": {
+            "path": str(BASELINE_BENCH),
+            "sha256": sha256_file(BASELINE_BENCH)
+            if BASELINE_BENCH.is_file() else None,
+        },
         "shared_dependencies": {
             name: linked_dependencies(BUILD / name)
             for name in BINARIES if (BUILD / name).is_file()
@@ -614,7 +683,8 @@ def stable_snapshot(snapshot):
 
 
 def command_for(harness, stem, iterations, budget):
-    binary = BUILD / harness["binary"]
+    binary = pathlib.Path(harness["path"]) if harness.get("path") \
+        else BUILD / harness["binary"]
     arguments = [str(binary)]
     if harness["mode"]:
         arguments.append(harness["mode"])
@@ -806,8 +876,32 @@ def main():
         return 0
 
     for name in BINARIES:
+        # goose-deflate is fetched from the network by `make bench-competitors`
+        # and zlib 1.4 is built by `make bench-zlib14`, so their absence is a
+        # skipped row rather than a broken run.
+        if name in OPTIONAL_BINARIES:
+            continue
         if not (BUILD / name).is_file():
             raise SystemExit("missing %s; run `make bench-build` first" % name)
+    if not BASELINE_BENCH.is_file():
+        raise SystemExit("missing the immutable baseline binary %s; run "
+                         "`make baseline-verify` first" % BASELINE_BENCH)
+
+    # A row whose binary is absent is skipped and named, never silently
+    # dropped: a comparison that quietly loses a row is a comparison the
+    # reader cannot audit.
+    skipped_rows = []
+    for harness in list(HARNESSES):
+        path = pathlib.Path(harness["path"]) if harness.get("path") \
+            else BUILD / harness["binary"]
+        if not path.is_file():
+            HARNESSES.remove(harness)
+            skipped_rows.append({"label": harness["label"],
+                                 "missing": str(path)})
+    if skipped_rows:
+        print("skipped %d row(s) whose binary is absent:" % len(skipped_rows))
+        for entry in skipped_rows:
+            print("  %s (%s)" % (entry["label"], entry["missing"]))
 
     lock_handle = None
     if arguments.lock_file:
@@ -1061,6 +1155,7 @@ def main():
                        "libdeflate is a throughput reference and does not rank streaming",
         },
         "inputs": manifest["inputs"],
+        "skipped_rows": skipped_rows,
         "rows": rows,
     }
     pathlib.Path(arguments.output).write_text(

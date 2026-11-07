@@ -16,12 +16,23 @@ The commands are in [How the identities were verified](#how-the-identities-were-
 | goose-compress (this package) | Goose + C adapter over zlib | baseline `c99b049`, work `36d9b45`, this cycle's commits | `git log`, `.build/baseline/archive/c99b049-v6` (57/57 SHA256SUMS) |
 | kaitk/goose-compress | Goose, encoder only | `ebf372eac4638a692ee89eba3204c666c101d7d9` | `git clone` + `git log -1` |
 | Macho0x/goose-deflate | Goose, whole-buffer codec | `3b1d0d38be908dbb9bc2e26411bfd7449c570147` (v0.2.3) | `git clone` + `git log -1` |
-| zlib | C, streaming | 1.3.2, `/usr/lib/libz.so.1.3.2` sha256 `6c78c5e5…075ca9` | `zlibVersion()`, `pacman -Q zlib` |
+| zlib (distribution) | C, streaming | 1.3.2, `/usr/lib/libz.so.1.3.2` sha256 `6c78c5e5…075ca9` | `zlibVersion()`, `pacman -Q zlib` |
+| zlib (upstream latest) | C, streaming | 1.4, built static into `.build/competitors/zlib-1.4` | tarball sha256 `02dd1597…6ad584`, `ZLIB_VERSION` |
 | zlib-ng | C, streaming, `zng_` prefix | 2.3.3, `/usr/lib/libz-ng.so.2.3.3` sha256 `471f8566…65ec6` | `ZLIBNG_VERSION`, `pacman -Q zlib-ng` |
 | libdeflate | C, whole-buffer | 1.26, `/usr/lib/libdeflate.so.0` sha256 `22449665…3dd3dd` | `LIBDEFLATE_VERSION_STRING`, `pacman -Q libdeflate` |
 
 Upstream release pages, read on 2026-11-07:
 
+- zlib 1.4, released 2026-11-04 — <https://www.zlib.net/manual.html> states
+  "version 1.4, November 4th, 2026" and `ZLIB_VERNUM 0x1400`. Its ChangeLog
+  lists inflate fixes this package depends on: "Fix inaccurate total_in after
+  Z_NEED_DICT returned", "Detect and report bad deflateSetDictionary() calls",
+  "Fix window write overrun after inflateSync()", "Fix inflateGetDictionary()
+  write past buffer on invalid window size", and the documented behaviour
+  change "Raw deflate that completes exactly at the end of the output buffer
+  now returns Z_STREAM_END instead of Z_OK". The distribution still ships
+  1.3.2, so 1.4 is built static under `.build/competitors/zlib-1.4` and never
+  replaces the system library.
 - zlib 1.3.2, released 2026-02-17, "Address the findings of the just-completed
   7ASecurity audit" — <https://github.com/madler/zlib/releases/tag/v1.3.2>
 - zlib-ng 2.3.3 — <https://github.com/zlib-ng/zlib-ng/releases>
@@ -37,34 +48,52 @@ consequence is named. This is the table that decides what may be ranked.
 | Guarantee | goose-compress | zlib / zlib-ng (streaming) | libdeflate | goose-deflate | kaitk/goose-compress |
 | --- | --- | --- | --- | --- | --- |
 | Streaming decode | yes, `feed`/`finish` | yes, `inflate` | no, whole buffer only | no | n/a, encoder only |
-| Output budget enforced by the decoder | yes, `Limits.output_bytes` | no, caller sizes `avail_out` and must stop | no, caller allocates the whole output | no, "no output-size cap" | n/a |
-| Input budget enforced by the decoder | yes, `Limits.input_bytes` | no, caller sizes `avail_in` | no | no | n/a |
-| Member policy | yes, `Trailing.Reject/Allow/Members` + `Limits.members` | no, caller loops `inflateReset` | no | one member, rejects bytes after it | n/a |
-| Trailing-data policy | yes, three explicit policies | no | no | reject only | n/a |
-| Error taxonomy | 11 named `Error` values | `Z_*` codes + `msg` strings | `libdeflate_result` enum | trailing `bool` | n/a |
+| Output budget enforced by the decoder | yes, `Limits.output_bytes`, cumulative across `feed` | no, caller sizes `avail_out` and must stop | yes, `out_nbytes_avail` per call, `LIBDEFLATE_INSUFFICIENT_SPACE` | no, "no output-size cap" | n/a |
+| Input budget enforced by the decoder | yes, `Limits.input_bytes`, cumulative | no, caller sizes `avail_in` | no, but a one-shot call knows `in_nbytes`, so the check is exact and free | no | n/a |
+| Member policy | yes, `Trailing.Reject/Allow/Members` + `Limits.members` | no, caller loops `inflateReset` | no: first member only, `actual_in_nbytes` locates its end | one member, rejects bytes after it | n/a |
+| Trailing-data policy | yes, three explicit policies | no | no policy, but `actual_in_nbytes < in_nbytes` detects it | reject only | n/a |
+| Error taxonomy | 11 named `Error` values | `Z_*` codes + `msg` strings | 4-value `libdeflate_result`; no checksum/malformed split | trailing `bool` | n/a |
 | Preset dictionary | yes, `dictionary`, with `DictionaryRequired`/`DictionaryMismatch` | yes, `inflateSetDictionary` | no | rejected | n/a |
+| Cumulative budget across calls | yes | caller's loop | no, there are no calls | no | n/a |
 | Handle lifetime / stale handle rejection | yes, generation-checked handle | caller owns `z_stream` | caller owns buffers | n/a | n/a |
 | Independent decoders from several threads | yes, per-decoder lock, measured | yes, one `z_stream` per thread | yes, stateless | n/a | n/a |
 | Same handle from two threads | contract violation, serialised, not freed under the caller | undefined | n/a | n/a | n/a |
 
-Two rows decide the whole comparison:
+Three things decide the comparison, and they are not the same thing:
 
-1. **Output budget.** goose-compress refuses a stream that would exceed
-   `output_bytes` with `Error.LimitExceeded` and stops. zlib and zlib-ng will
-   happily keep decoding as long as the caller keeps handing them output space;
-   the budget is the caller's loop, not the library's promise. libdeflate and
-   goose-deflate have no budget at all — goose-deflate's own `PORTING.md` says
-   "There is no streaming API and no output-size cap. A hostile stream can grow
-   until the data stack stops it."
-2. **Input budget.** Same shape. `Limits.input_bytes` is enforced inside the
-   decoder, including bytes after the last member.
+1. **A bounded output buffer.** libdeflate has this: `out_nbytes_avail` is a
+   real cap, and a stream that would exceed it returns
+   `LIBDEFLATE_INSUFFICIENT_SPACE` instead of writing past the buffer. So
+   libdeflate is *not* unbounded, and an earlier draft of this document was
+   wrong to say it was. For a single call, the buffer cap and the output budget
+   are the same number, which is why the libdeflate row is comparable to
+   goose-compress `oneshot`.
+2. **A cumulative budget across calls.** libdeflate does not have this, and
+   cannot: there are no calls, because the whole input and the whole output are
+   in memory at once. goose-compress's `Limits.output_bytes` is cumulative
+   across `feed`, so a caller can hand it a stream in pieces and still be
+   guaranteed a total. That guarantee is what a streaming decoder is for, and
+   it is the one libdeflate cannot make.
+3. **A refusal taxonomy.** libdeflate reports `LIBDEFLATE_BAD_DATA` for a
+   malformed stream, a truncated stream and a trailer mismatch alike. It cannot
+   tell a caller "the CRC was wrong" as opposed to "the Huffman code was
+   invalid". goose-compress has eleven named errors. That is a contract
+   difference, not a speed difference.
+
+zlib and zlib-ng sit in between: they stream, but the budget is the caller's
+loop, not the library's promise. A caller that gets the loop wrong gets a
+decoder that is fast and unbounded. `bench/compare/zlib_bounded.c` exists to
+show what the loop costs when it is written correctly, so the zlib row is
+measured at the same contract rather than at a looser one.
+
+goose-deflate is the only row with genuinely no cap: its own `PORTING.md` says
+"There is no streaming API and no output-size cap. A hostile stream can grow
+until the data stack stops it."
 
 So a row that decodes a valid 8 MiB stream faster than goose-compress has not
 been shown to be a better decoder for this package's job. It has been shown to
-be faster at the part of the job that both do. That is why
-`bench/compare/zlib_bounded.c` exists: it re-implements the budget, member and
-trailing policies on top of zlib so that the zlib row is measured at the same
-contract. Without it the zlib row would be a different program.
+be faster at the part of the job that both do. The rows are grouped by which of
+the three guarantees they make, and only rows in the same group are ranked.
 
 ### The zlib reference row is a transliteration, not a wrapper
 
@@ -76,11 +105,16 @@ trailing policies, and the same status codes. `bench/compare/contract_parity.py`
 drives both through the same 1081 cases and compares status, consumed,
 produced, members and trailing on every one.
 
-Result on both backends: **1081 cases, 2162 checks, 0 disagreements**, on zlib
-1.3.2 and on zlib-ng 2.3.3. Three dictionary fixtures are excluded from the
-parity run and reported as excluded, because the reference row does not
-implement `inflateSetDictionary`; they are covered by `tests/contract.goose`
-instead.
+Result on all three backends: **1081 cases, 2162 checks, 0 disagreements**, on
+zlib 1.3.2, on zlib-ng 2.3.3 and on zlib 1.4. Three dictionary fixtures are
+excluded from the parity run and reported as excluded, because the reference row
+does not implement `inflateSetDictionary`; they are covered by
+`tests/contract.goose` instead.
+
+zlib 1.4 is the interesting one, because it changes inflate behaviour this
+package depends on: raw deflate that completes exactly at the end of the output
+buffer now returns `Z_STREAM_END` instead of `Z_OK`. `feed` accepts both, and
+the parity run confirms it: the same 1081 cases, the same answers.
 
 The cases include: empty input, truncated at every prefix length, a corrupted
 byte at the start, middle and end of the compressed stream, a corrupted CRC, a
@@ -104,15 +138,58 @@ It was verified on both backends actually linked here:
 | --- | --- | --- | --- |
 | zlib 1.3.2 | `Error.Checksum` | `Error.Checksum` | `Error.Checksum` |
 | zlib-ng 2.3.3 | `Error.Checksum` | `Error.Checksum` | `Error.Checksum` |
+| zlib 1.4 | `Error.Checksum` | `Error.Checksum` | `Error.Checksum` |
 
-Both were driven through `bench/compare/contract_parity.py --reference`, which
-compares the reference row against the Goose row case by case, so a backend
-that classified a trailer mismatch as `Error.Malformed` would show up as a
-disagreement rather than as a silent difference. This is a real fragility: a
+All three were driven through `bench/compare/contract_parity.py --reference`,
+which compares the reference row against the Goose row case by case, so a
+backend that classified a trailer mismatch as `Error.Malformed` would show up
+as a disagreement rather than as a silent difference. This is a real fragility: a
 future zlib that rewords those messages would turn `Error.Checksum` into
 `Error.Malformed` without any test failing on the old backend. The mitigation
 is that the parity run is part of `make bench-parity` and names the backend it
 ran against.
+
+### The libdeflate row was checked the same way, and disagrees on purpose
+
+`bench/compare/libdeflate_oneshot.c` implements the one-shot bounded contract on
+top of `libdeflate_gzip_decompress_ex`: `out_nbytes_avail` is the output budget,
+`actual_in_nbytes < in_nbytes` is `Trailing.Reject`, and the input budget is a
+length check. Running the same parity script against it is expected to report
+disagreements, and it does:
+
+```
+$ python3 bench/compare/contract_parity.py --goose "$GOOSE" \
+      --reference .build/libdeflate-oneshot \
+      --output .build/contract-parity-libdeflate.json
+contract parity: 2776 disagreement(s) over 1081 cases
+```
+
+Classified by the `error` field, over 1081 cases:
+
+| Reference (libdeflate row) | Library (goose-compress) | Cases | Why |
+| --- | --- | --- | --- |
+| `unsupported_policy` | anything | 365 | the row implements `Trailing.Reject` only, and says so instead of reporting `none` |
+| `malformed_stream` | `truncated_stream` | 53 | libdeflate has no truncation code |
+| `malformed_stream` | `checksum_mismatch` | 33 | libdeflate has no trailer-mismatch code |
+| `malformed_stream` | `dictionary_required` | 11 | libdeflate has no preset dictionary |
+| `malformed_stream` | `limit_exceeded` | 6 | budget ordering, see below |
+| `limit_exceeded` | `trailing_data` / `malformed_stream` / `checksum_mismatch` / `dictionary_required` / `truncated_stream` | 14 | budget ordering, see below |
+
+The remaining disagreements are `members` (libdeflate does not count members),
+and `produced` / `consumed` / `fnv1a` on a failure (libdeflate reports nothing
+partial, goose-compress reports the prefix it decoded).
+
+The 20 budget-ordering cases are a property of the harness, not of libdeflate:
+a one-shot call is handed the whole input at once, so the input budget is a
+length check applied before the decode, while goose-compress checks the budget
+as it consumes. A stream that is both too large and malformed therefore reports
+`limit_exceeded` in the row and the stream error in the library. libdeflate has
+no input budget at all, so there is nothing to compare there.
+
+What the row *does* agree on is the part that matters for the output budget:
+at an exact budget, one byte under, one byte over and zero, both report
+`none` / `limit_exceeded` / `none` / `limit_exceeded` on the same fixture. That
+is the check that makes the row comparable at all.
 
 ## Interop, ownership and API cost
 
@@ -148,22 +225,30 @@ API: `inflate::decode(src: u8[:]) -> u8[>..], bool`, plus
   labelled `comparable: false` in `bench/runner.py`. It is reported, never
   ranked against a bounded row.
 
-### libdeflate — whole-buffer, no streaming, no budget
+### libdeflate — whole-buffer, bounded per call, no streaming
 
-API: `libdeflate_gzip_decompress_ex` into a caller-allocated buffer, returning
-a `libdeflate_result`.
+API: `libdeflate_gzip_decompress_ex(decompressor, in, in_nbytes, out,
+out_nbytes_avail, &actual_in_nbytes, &actual_out_nbytes)`, returning a
+`libdeflate_result`.
 
-- **Ownership.** The caller must know the output size in advance or allocate a
-  guess and retry. There is no incremental state, so a stream that arrives in
-  pieces must be buffered whole first.
+- **Ownership.** The caller owns both buffers and must size the output. The cap
+  is enforced: libdeflate will not write past `out_nbytes_avail`, and reports
+  `LIBDEFLATE_INSUFFICIENT_SPACE` when the stream wants more. There is no
+  incremental state, so a stream that arrives in pieces must be buffered whole
+  first, and the caller must know or guess the output size before the call.
 - **Interop.** A C dependency with its own ABI, its own versioning and its own
   allocator hooks. It is the fastest whole-buffer decoder here, and it is
   fastest precisely because it is allowed to assume the whole input and the
   whole output are in memory at once.
-- **API cost.** No member policy, no trailing policy, no dictionary, no
-  streaming. Its result enum is coarser than this package's `Error`.
-- **Measured as a one-shot row** (`bench/compare/libdeflate_oneshot.c`), on
-  valid input only, labelled `comparable: false` for the bounded contract.
+- **API cost.** No cumulative budget, no member policy, no trailing policy, no
+  dictionary, no streaming, and a four-value result enum that cannot separate a
+  checksum mismatch from a malformed stream. `actual_in_nbytes` does let a
+  caller detect trailing bytes after the first member, which is what
+  `bench/compare/libdeflate_oneshot.c` does to implement `Trailing.Reject`.
+- **Measured as a bounded one-shot row** (`bench/compare/libdeflate_oneshot.c`),
+  labelled `comparable: true` against goose-compress `oneshot` and against
+  nothing else. It does not rank the streaming rows, because it cannot make the
+  cumulative-budget guarantee they make.
 
 ### zlib and zlib-ng — streaming, budget is the caller's loop
 
@@ -185,14 +270,14 @@ API: `inflate`/`inflateInit2`/`inflateReset`/`inflateSetDictionary`, with
 
 ## What this means for ranking
 
-- **Bounded streaming decode** (this package's contract): the only comparable
-  rows are goose-compress and `zlib_bounded` on zlib 1.3.2 and on zlib-ng
-  2.3.3. Those are ranked in `docs/benchmark.md` with the exact workload.
-- **Whole-buffer decode of valid input**: libdeflate and goose-deflate are
-  measured, and are not ranked against the bounded rows. A whole-buffer decoder
-  being faster on valid input says nothing about whether it refuses the same
-  inputs or enforces the same budget, and this document does not pretend
-  otherwise.
+- **Bounded streaming decode** (this package's contract): goose-compress,
+  `zlib_bounded` on zlib 1.3.2, on zlib-ng 2.3.3 and on zlib 1.4. These share
+  a contract and are ranked in `docs/benchmark.md` with the exact workload.
+- **Bounded one-shot decode**: goose-compress `oneshot` and
+  `libdeflate_oneshot`. Both cap the output; neither can be handed a stream in
+  pieces. Ranked against each other, and not against the streaming rows.
+- **Unbounded whole-buffer decode**: goose-deflate only. Measured, never
+  ranked.
 - **Encoding**: out of scope for this cycle. kaitk/goose-compress is the
   reference if it ever comes in scope.
 
@@ -218,6 +303,13 @@ sha256sum /usr/lib/libz.so.1.3.2 /usr/lib/libz-ng.so.2.3.3 /usr/lib/libdeflate.s
 # Contract parity of the reference row, per backend
 make bench-parity
 python3 bench/compare/contract_parity.py --goose "$GOOSE" --reference .build/zlib-ng-bounded
+make bench-zlib14
+python3 bench/compare/contract_parity.py --goose "$GOOSE" --reference .build/zlib14-bounded
+
+# The libdeflate row, which is expected to disagree: see the table above
+python3 bench/compare/contract_parity.py --goose "$GOOSE" \
+    --reference .build/libdeflate-oneshot \
+    --output .build/contract-parity-libdeflate.json
 
 # Trailer-mismatch classification, on each backend actually linked
 for f in gzip-bad-crc gzip-bad-isize zlib-bad-adler; do

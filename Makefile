@@ -22,8 +22,8 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
 
 .PHONY: setup format check fixtures corpus native concurrency concurrency-tsan \
         test sanitize sanitize-negative \
-        bench bench-build bench-competitors bench-parity bench-plan bench-run \
-        baseline baseline-verify clean
+        bench bench-build bench-competitors bench-zlib14 bench-parity bench-plan \
+        bench-run baseline baseline-verify clean
 
 setup:
 	./scripts/setup-goose.sh
@@ -145,6 +145,31 @@ bench-competitors:
 	fi
 	"$(GOOSE)" build bench/compare/goose_deflate_bench.goose --cc $(BENCH_CC) -O2 \
 		-o .build/goose-deflate-bench
+
+# zlib 1.4 (4 Nov 2026) is newer than the distribution's 1.3.2, and it changes
+# inflate behaviour this package depends on: raw deflate that completes exactly
+# at the end of the output buffer now returns Z_STREAM_END instead of Z_OK, and
+# it fixes total_in after Z_NEED_DICT plus bad deflateSetDictionary() calls.
+# It is built static into .build/ so the system library is never replaced.
+ZLIB14_VERSION ?= 1.4
+ZLIB14_SHA256 ?= 02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584
+ZLIB14_TARBALL ?= .build/competitors/zlib-$(ZLIB14_VERSION).tar.gz
+ZLIB14_DIR ?= .build/competitors/zlib-$(ZLIB14_VERSION)
+bench-zlib14:
+	mkdir -p .build/competitors
+	if [ ! -f "$(ZLIB14_TARBALL)" ]; then \
+		curl -fsSL -o "$(ZLIB14_TARBALL)" \
+			https://zlib.net/zlib-$(ZLIB14_VERSION).tar.gz; \
+	fi
+	echo "$(ZLIB14_SHA256)  $(ZLIB14_TARBALL)" | sha256sum -c -
+	rm -rf "$(ZLIB14_DIR)"
+	mkdir -p "$(ZLIB14_DIR)"
+	tar xzf "$(ZLIB14_TARBALL)" -C "$(ZLIB14_DIR)" --strip-components=1
+	cd "$(ZLIB14_DIR)" && CFLAGS="-O2 -fPIC" ./configure --static >/dev/null \
+		&& $(MAKE) -j4 libz.a >/dev/null
+	$(BENCH_CC) $(CFLAGS) -O2 -I"$(ZLIB14_DIR)" bench/compare/zlib_bounded.c \
+		"$(ZLIB14_DIR)/libz.a" -o .build/zlib14-bounded
+	./.build/zlib14-bounded --clamp-selftest
 
 # Proves the C reference row implements the same contract as the library before
 # any number from it is used to rank anything.

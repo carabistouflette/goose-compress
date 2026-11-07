@@ -15,10 +15,12 @@ No performance measurement was run. See [docs/benchmark.md](docs/benchmark.md).
 | Chunking invariance | the same answer under 7 chunk sizes | `tests/boundaries.goose` |
 | API and ownership | lifecycle, invalid limits, terminal failure, cleanup | `tests/api.goose` |
 | Differential | 100,000 generated cases against an independent oracle | `tests/differential.goose` |
-| Native adapter | 115 direct C-level checks | `tests/driver.c` |
+| Native adapter | 119 direct C-level checks | `tests/driver.c` |
+| Concurrency | independent decoders, stale handles, exhaustion, close-while-in-flight | `tests/concurrency.c` |
 | Artefact integrity | fixtures, corpus, oracle and source fingerprint are what they claim | `tests/test_compress.py` |
 | Consumer | the example runs and refuses what it should | `scripts/example_check.py` |
 | Sanitizers | ASan and UBSan clean, no leaks, instrumentation proven live | `make sanitize` |
+| ThreadSanitizer | the registry refcount and the per-decoder lock are race-free | `make concurrency-tsan` |
 
 ## Fixtures
 
@@ -143,13 +145,16 @@ SANITIZER_CC=clang ./scripts/sanitizer-cc.sh -O1 -g -Inative \
     -lz -lpthread -lm -ldl
 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
     ./.build/driver-sanitize --selftest
-driver ok: 115 checks
+driver ok: 119 checks
+concurrency ok: 58 checks
 sanitize: spec
 spec ok: 48 fixtures
 sanitize: boundaries
 boundaries ok: 336 chunked runs
 sanitize: api
 api ok
+sanitize: contract
+contract ok: 118 checks
 sanitize: differential
 differential ok: 100000 cases
 checking goose translation unit with clang
@@ -190,6 +195,62 @@ last step of `make sanitize`:
 
 Both checks build into `.build/negative/` and leave the repository untouched.
 `make sanitize-negative` runs them alone.
+
+## Concurrency
+
+`tests/concurrency.c` checks the half of the contract that says separate
+decoders are independent, and the lifetime rule that makes `close` safe while
+another thread is inside a decoder.
+
+```
+$ make concurrency
+cc -std=c11 -Wall -Wextra -Werror -O2 -Inative tests/concurrency.c \
+    native/compress.c -lz -lpthread -DGC_TEST_WRAP_INFLATE \
+    -Wl,--wrap=inflate -o .build/concurrency
+timeout 120 ./.build/concurrency --selftest
+concurrency ok: 58 checks
+```
+
+The checks are: eight threads decoding eight independent streams produce the
+right bytes and leave no slot open; a handle closed by one thread is rejected
+by another; a full table reports `Error.SystemError` and a freed slot is
+reusable; 8 × 500 open/close rounds leave the table empty; and a close that
+starts while a decode is genuinely inside `inflate` waits for it.
+
+That last one is the one that cannot be established by sleeping. The test
+binary is linked with `-Wl,--wrap=inflate`, and the wrapper posts a semaphore
+before it calls the real `inflate` and waits for a second one, so the decode is
+provably in flight with a reference held. The test then starts the close,
+spins until `gc_abi` reports the slot retired, and asserts that the close has
+not returned, that a lookup on the retired handle is refused, and that the slot
+is reusable afterwards. The wrap lives in the test binary only; the library is
+unchanged.
+
+The check is not vacuous. Removing the `while (decoder->refs > 0)
+pthread_cond_wait(...)` line from `gc_close` and rebuilding the same test under
+ASan produces:
+
+```
+==ERROR: AddressSanitizer: heap-use-after-free on address ...
+READ of size 4 at ... thread T19
+    #0 gc_inflate .../compress.c:275
+    #1 race_inflate_worker .../tests/concurrency.c:328
+freed by thread T20 here:
+    #0 free
+    #1 gc_close .../compress.c:339
+```
+
+so the wait is what stands between the test and a use-after-free.
+
+`make concurrency-tsan` builds the same test with `-fsanitize=thread` and runs
+it under `TSAN_OPTIONS=halt_on_error=1`; it reports `concurrency ok: 58 checks`
+with no race. ThreadSanitizer is the only tool here that sees the registry
+refcount and the per-decoder lock, so it is a separate target rather than part
+of `make sanitize`.
+
+Every run is bounded by `CONCURRENCY_TIMEOUT` (default 120 s), and the test
+exits non-zero on a `pthread_create`, `pthread_join` or barrier error instead of
+waiting on a barrier that can never be reached.
 
 ## Resource bounds
 

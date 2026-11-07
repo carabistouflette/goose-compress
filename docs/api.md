@@ -116,7 +116,10 @@ Consumes all of `input` and appends decoded bytes to `out`.
   `Malformed` failure reports the prefix it managed to decode. The caller
   decides whether to keep them.
 - `out` grows by at most 65,536 bytes per internal step, and never beyond
-  `limits.output_bytes` in total.
+  `limits.output_bytes` in total. The step is sized to the stream rather than
+  fixed: it is `min(chunk_bytes, max(4096, produced))`, so a small stream is not
+  charged a 64 KiB zero-fill per call and a large one still gets the full
+  64 KiB. The bound above is the maximum, not the constant.
 
 ### `finish(decoder) -> Error`
 
@@ -214,7 +217,7 @@ Two consequences are worth stating because they are easy to get wrong:
 | --- | --- |
 | Native state per decoder | one `z_stream`, about 40 KiB, fixed |
 | Open decoders | 32, then `Error.SystemError` |
-| Output per `feed` step | 65,536 bytes |
+| Output per `feed` step | 65,536 bytes maximum; `min(chunk_bytes, max(4096, produced))` |
 | Output per decoder | `limits.output_bytes`, at most 1 GiB |
 | Input per decoder | `limits.input_bytes`, at most 1 GiB |
 | Dictionary | 32,768 bytes |
@@ -223,5 +226,19 @@ Two consequences are worth stating because they are easy to get wrong:
 ## Concurrency
 
 One decoder is not safe to use from two threads at once. Separate decoders are
-independent; the handle table is mutex-protected, so `open` and `close` from
-different threads are safe.
+independent, and they run at the same time: the registry lock is held only for a
+handle lookup and a reference release, never across `inflate`, and each decoder
+carries its own mutex. `open` and `close` from different threads are safe.
+
+`close` retires the handle first, so a lookup on it fails immediately, and then
+waits for any call already inside that decoder before it frees. A caller that
+breaks the one-thread-per-decoder rule therefore gets serialised calls rather
+than a use-after-free, but the result is still undefined and still a bug in the
+caller.
+
+Measured on this machine (8 cores, 4 fast and 4 slow, no SMT), 1 MiB text,
+median decodes per second over 5 repetitions of 20 decodes per thread: 1 thread
+1801, 2 threads 3378, 4 threads 6592, 8 threads 9512. Pinned to the four fast
+cores, 4 threads reach 7500 against 2033 for one, and 8 threads do not improve
+on that because there are only four cores. `tests/concurrency.c` asserts the
+correctness half of this; `--throughput` reports the scaling.
