@@ -136,7 +136,14 @@ static void test_inflate(void) {
           "inflate: a short meta is invalid");
     check(gc_close(handle, close_view) == GC_OK, "inflate: close after refusals");
 
-    /* A corrupted trailer is a checksum failure, not a malformed stream. */
+    /* A corrupted trailer is a checksum failure, not a malformed stream.
+     *
+     * The adapter decides this from zlib's message text, which is a property of
+     * the linked zlib rather than of the format. All three trailer kinds are
+     * therefore asserted here, on whichever backend this binary was built
+     * against: `make native` checks zlib, `make native-ng` checks zlib-ng. A
+     * backend that words the message differently fails this test instead of
+     * silently reclassifying a bad checksum as malformed data. */
     uint8_t broken[256];
     memcpy(broken, stream, (size_t)gzip_len);
     broken[gzip_len - 8] ^= 0xff;
@@ -145,6 +152,28 @@ static void test_inflate(void) {
     check(status == GC_CHECKSUM, "inflate: a bad CRC is a checksum failure");
     check(meta[1] == (int64_t)payload_len, "inflate: the payload survives the bad CRC");
     check(gc_close(handle, close_view) == GC_OK, "inflate: close after a checksum failure");
+
+    /* The gzip ISIZE field, which zlib reports with its own message. */
+    memcpy(broken, stream, (size_t)gzip_len);
+    broken[gzip_len - 4] ^= 0xff;
+    handle = open_format(GC_GZIP);
+    status = feed(handle, broken, gzip_len, output, sizeof output, meta);
+    check(status == GC_CHECKSUM, "inflate: a bad ISIZE is a checksum failure");
+    check(meta[1] == (int64_t)payload_len, "inflate: the payload survives the bad ISIZE");
+    check(gc_close(handle, close_view) == GC_OK, "inflate: close after a bad ISIZE");
+
+    /* The zlib adler32, which is a different code path in zlib again. The
+     * zlib-format stream goes in its own buffer so the gzip stream above stays
+     * intact for the truncation case below. */
+    uint8_t zstream[256];
+    int64_t adler_stream_len = build_zlib(zstream, payload, payload_len);
+    memcpy(broken, zstream, (size_t)adler_stream_len);
+    broken[adler_stream_len - 1] ^= 0xff;
+    handle = open_format(GC_ZLIB);
+    status = feed(handle, broken, adler_stream_len, output, sizeof output, meta);
+    check(status == GC_CHECKSUM, "inflate: a bad adler32 is a checksum failure");
+    check(meta[1] == (int64_t)payload_len, "inflate: the payload survives the bad adler32");
+    check(gc_close(handle, close_view) == GC_OK, "inflate: close after a bad adler32");
 
     /* An invalid block type is malformed. */
     static const uint8_t bad_block[] = {0x07, 0x00};

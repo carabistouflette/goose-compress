@@ -17,6 +17,15 @@ Fixtures that need a preset dictionary are excluded: the reference has no
 dictionary support, so it cannot be an equal-contract row for them. That
 exclusion is reported, not hidden.
 
+Corrupted streams are compared too, because the checksum classification is the
+one place where the two sides do not share code: the library decides
+`Error.Checksum` from zlib's message text, and that text is a property of the
+linked zlib, not of the format. A backend that words the message differently
+would silently reclassify a bad CRC as `Error.Data`. So every fixture is also
+run with a flipped byte in the gzip CRC32 field, in the gzip ISIZE field, in
+the zlib adler32 field, and in the middle of the deflate payload, and the two
+sides must agree on the error name.
+
     python3 bench/compare/contract_parity.py --goose /path/to/goose
 """
 
@@ -25,6 +34,7 @@ import json
 import pathlib
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 BUILD = ROOT / ".build"
@@ -188,12 +198,53 @@ def main():
                         failures, checks, limits["output_bytes"])
                 cases += 1
 
+    # Corrupted streams. The trailer fields are located from the format, not
+    # from a guess: gzip ends with CRC32 then ISIZE, zlib ends with adler32,
+    # raw has no trailer. A payload byte in the middle is corrupted for every
+    # format, which is the case where the two sides may legitimately disagree
+    # on `invalid data` versus `invalid distance` wording.
+    corruption_cases = 0
+    with tempfile.TemporaryDirectory(dir=str(BUILD)) as scratch:
+        for entry in manifest["fixtures"]:
+            if entry["dictionary"]:
+                continue
+            name = entry["name"]
+            source = FIXTURES / (name + ".in")
+            data = bytearray(source.read_bytes())
+            format_name = FORMATS[entry["format"]]
+            limits = entry["limits"]
+            policy = POLICIES[entry["trailing"]]
+            members = limits["members"]
+            targets = [("payload", len(data) // 2)]
+            if format_name == "gzip" and len(data) >= 8:
+                targets.append(("crc32", len(data) - 8))
+                targets.append(("isize", len(data) - 4))
+            elif format_name == "zlib" and len(data) >= 4:
+                targets.append(("adler32", len(data) - 4))
+            for field, offset in targets:
+                if offset < 0 or offset >= len(data):
+                    continue
+                corrupted = bytearray(data)
+                corrupted[offset] ^= 0xFF
+                path = pathlib.Path(scratch) / ("%s-%s.bin" % (name, field))
+                path.write_bytes(bytes(corrupted))
+                label = "%s corrupted=%s" % (name, field)
+                compare(label,
+                        reference(format_name, path, limits["output_bytes"],
+                                  limits["input_bytes"], 65536, policy, members),
+                        library(goose, format_name, path,
+                                limits["output_bytes"], limits["input_bytes"],
+                                65536, policy, members),
+                        failures, checks, limits["output_bytes"])
+                corruption_cases += 1
+
     report = {
         "reference": str(reference_binary),
         "library": str(goose),
         "probe": str(PROBE),
         "fixtures": len(manifest["fixtures"]),
         "cases": cases,
+        "corruption_cases": corruption_cases,
         "checks": checks[0],
         "skipped_dictionary_fixtures": skipped,
         "failures": failures,
@@ -208,8 +259,9 @@ def main():
         print("contract parity: %d disagreement(s) over %d cases"
               % (len(failures), cases))
         return 1
-    print("contract parity ok: %d cases, %d checks, %d dictionary fixture(s) "
-          "excluded" % (cases, checks[0], len(skipped)))
+    print("contract parity ok: %d cases (%d corrupted), %d checks, "
+          "%d dictionary fixture(s) excluded"
+          % (cases, corruption_cases, checks[0], len(skipped)))
     return 0
 
 
