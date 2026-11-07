@@ -27,6 +27,7 @@ import json
 import os
 import pathlib
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -40,6 +41,11 @@ INPUTS = BUILD / "bench-inputs"
 # identity cannot drift while the new one is being changed.
 BASELINE_BENCH = BUILD / "baseline" / "archive" / "c99b049-v6" / "variants" / \
     "release" / "bench"
+
+# zlib-ng built with -DZLIB_COMPAT, which installs a libz.so.1 with zlib's ABI.
+# Pointing LD_LIBRARY_PATH at it runs the *unchanged* Goose binary on the faster
+# backend, so the row measures the real public API rather than a C harness.
+COMPAT_LIB = BUILD / "competitors" / "zlib-ng-compat" / "lib"
 
 sys.path.insert(0, str(ROOT / "bench"))
 import measure  # noqa: E402  (prepare, provenance, fnv1a, SIZES, ITERATIONS)
@@ -85,27 +91,39 @@ HARNESSES = [
         "role": "end-of-stream consumer cost",
     },
     {
-        "label": "zlib bounded (same contract)",
+        "label": "zlib bounded whole (same contract)",
         "binary": "zlib-bounded",
-        "mode": None,
-        "contract": "bounded: output budget, input budget, 1 member, trailing rejected",
+        "mode": "whole",
+        "contract": "bounded: output budget, input budget, 1 member, trailing "
+                    "rejected, whole input in one call",
         "buffer": "reused across calls",
         "comparable": True,
-        "role": "the same zlib under the same framing policy: overhead, not a ranking",
+        "role": "the same zlib under the same framing policy, whole-input "
+                "shape: the cost of the bounded state machine, not a ranking",
     },
     {
-        "label": "zlib-ng bounded (same contract)",
+        "label": "zlib bounded stream (same contract)",
+        "binary": "zlib-bounded",
+        "mode": "stream",
+        "contract": "bounded: same limits, 64 KiB input steps",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the same zlib under the same framing policy, 64 KiB input "
+                "shape: comparable to the goose stream row",
+    },
+    {
+        "label": "zlib-ng bounded whole (same contract)",
         "binary": "zlib-ng-bounded",
-        "mode": None,
+        "mode": "whole",
         "contract": "bounded: output budget, input budget, 1 member, trailing rejected",
         "buffer": "reused across calls",
         "comparable": True,
         "role": "the same framing policy on a different zlib backend",
     },
     {
-        "label": "zlib 1.4 bounded (same contract)",
+        "label": "zlib 1.4 bounded whole (same contract)",
         "binary": "zlib14-bounded",
-        "mode": None,
+        "mode": "whole",
         "contract": "bounded: output budget, input budget, 1 member, trailing rejected",
         "buffer": "reused across calls",
         "comparable": True,
@@ -128,6 +146,41 @@ HARNESSES = [
         "buffer": "reused across calls",
         "comparable": True,
         "role": "the published baseline binary, unchanged, for the before/after",
+    },
+    {
+        "label": "goose-compress oneshot (zlib-ng compat backend)",
+        "binary": "bench",
+        "mode": "oneshot",
+        "contract": "bounded: output budget, input budget, 1 member, trailing "
+                    "rejected",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "library_path": str(COMPAT_LIB),
+        "requires": str(COMPAT_LIB / "libz.so.1"),
+        "role": "the same binary and the same policy code on zlib-ng through "
+                "its ZLIB_COMPAT ABI: the backend swap, with no adapter change",
+    },
+    {
+        "label": "goose-compress adapter + zlib (no Goose layer)",
+        "binary": "goose-adapter",
+        "mode": None,
+        "contract": "bounded: output budget, input budget, 1 member, trailing "
+                    "rejected, whole input in one call",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the adapter and zlib without the Goose layer: the difference "
+                "from `goose-compress oneshot` is what the Goose layer costs",
+    },
+    {
+        "label": "goose-compress adapter + zlib-ng (no Goose layer)",
+        "binary": "goose-adapter-ng",
+        "mode": None,
+        "contract": "bounded: output budget, input budget, 1 member, trailing "
+                    "rejected, whole input in one call",
+        "buffer": "reused across calls",
+        "comparable": True,
+        "role": "the same adapter on the faster backend: the difference from "
+                "`zlib-ng bounded whole` is what the adapter costs on top",
     },
     {
         "label": "goose-deflate whole buffer (no bounds)",
@@ -164,10 +217,12 @@ HARNESSES = [
 ]
 
 BINARIES = ["bench", "zlib-bounded", "zlib-ng-bounded", "zlib14-bounded",
-            "zlib-oneshot", "libdeflate-oneshot", "goose-deflate-bench"]
+            "zlib-oneshot", "libdeflate-oneshot", "goose-deflate-bench",
+            "goose-adapter", "goose-adapter-ng"]
 # Rows whose binary is fetched or built by an opt-in target. Their absence is a
 # skipped row, not a broken run.
-OPTIONAL_BINARIES = {"goose-deflate-bench", "zlib14-bounded"}
+OPTIONAL_BINARIES = {"goose-deflate-bench", "zlib14-bounded",
+                     "goose-adapter-ng"}
 INVALID_HARNESS = {
     "label": "goose-compress invalid",
     "binary": "bench",
@@ -434,12 +489,14 @@ def cpu_busy_fraction(before, after):
     return busy
 
 
-def context_switches():
-    """Voluntary and involuntary context switches of this process.
+def runner_context_switches():
+    """Voluntary and involuntary context switches of the runner process.
 
-    A deschedule shows up here even when the wall/CPU ratio of a single batch
-    is too coarse to see it, so the calibration records the delta across its
-    own window instead of inferring contention from timing alone.
+    This reads `/proc/self/status` of the Python process that drives the
+    campaign. It says nothing about the timed binaries: they are separate
+    processes with their own counters. It is used by `calibrate`, where the
+    process doing the work *is* this one, and it is recorded per round only as
+    a description of the driver, under a name that says so.
     """
     record = {}
     try:
@@ -452,6 +509,23 @@ def context_switches():
         elif line.startswith("nonvoluntary_ctxt_switches:"):
             record["nonvoluntary"] = int(line.split()[1])
     return record
+
+
+def children_context_switches():
+    """Voluntary and involuntary context switches of the reaped children.
+
+    `RUSAGE_CHILDREN` accumulates over every child this process has waited for,
+    so a difference between two reads is exactly the switches of the children
+    that ran in between. The sample loop runs one child at a time and waits for
+    each, so a per-round difference is attributable to that round's children
+    and to nothing else.
+
+    This is the counter that describes the timed binaries. The runner's own
+    `/proc/self/status` counters do not.
+    """
+    import resource
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return {"voluntary": usage.ru_nvcsw, "nonvoluntary": usage.ru_nivcsw}
 
 
 def calibrate(cpu, milliseconds, repeats, minimum):
@@ -485,7 +559,7 @@ def calibrate(cpu, milliseconds, repeats, minimum):
     walls = []
     name = "cpu%d" % cpu
     stat_before = per_cpu_stat()
-    switches_before = context_switches()
+    switches_before = runner_context_switches()
     wall_start = time.monotonic()
     cpu_start = time.process_time()
     deadline = wall_start + milliseconds / 1000.0
@@ -498,7 +572,7 @@ def calibrate(cpu, milliseconds, repeats, minimum):
     cpu_used = time.process_time() - cpu_start
     window = time.monotonic() - wall_start
     stat_after = per_cpu_stat()
-    switches_after = context_switches()
+    switches_after = runner_context_switches()
     if not ratios:
         return None
     busy = cpu_busy_fraction(stat_before, stat_after).get(name)
@@ -520,7 +594,9 @@ def calibrate(cpu, milliseconds, repeats, minimum):
         "batches": count,
         "minimum_batches": minimum,
         "shortfall": shortfall,
-        "context_switches": {
+        # The calibration batch runs inside this process, so here the runner's
+        # own counters are the right ones. The key says whose they are.
+        "runner_context_switches": {
             "voluntary": switches_after.get("voluntary", 0) - switches_before.get("voluntary", 0),
             "nonvoluntary": switches_after.get("nonvoluntary", 0) - switches_before.get("nonvoluntary", 0),
         },
@@ -574,7 +650,8 @@ def contention_report(allowed, selected, topology, busy, calibration, psi,
         "jitter_limit": gates["max_jitter"],
         "psi_some_avg10": (psi or {}).get("some", {}).get("avg10"),
         "psi_limit": gates["max_psi"],
-        "context_switches": (calibration or {}).get("context_switches"),
+        "runner_context_switches": (calibration or {}).get(
+            "runner_context_switches"),
         "batches": (calibration or {}).get("batches"),
         "minimum_batches": (calibration or {}).get("minimum_batches"),
     }
@@ -682,6 +759,20 @@ def stable_snapshot(snapshot):
             if key not in observations}
 
 
+def budget_for(entry, mode, headroom):
+    """The output budget handed to every row for this input.
+
+    `exact` is the tightest case: the budget equals the payload, so the decoder
+    must stop on the last byte. `headroom` is what a caller that does not know
+    the size does, which is the default in docs/api.md: a fixed budget far
+    above the payload. They are different workloads and are reported
+    separately, because a change that helps one can hurt the other.
+    """
+    if mode == "headroom":
+        return headroom
+    return entry["plain_bytes"]
+
+
 def command_for(harness, stem, iterations, budget):
     binary = pathlib.Path(harness["path"]) if harness.get("path") \
         else BUILD / harness["binary"]
@@ -693,15 +784,25 @@ def command_for(harness, stem, iterations, budget):
 
 
 def run_once(harness, stem, iterations, budget):
+    environment = None
+    if harness.get("library_path"):
+        import os
+        environment = dict(os.environ)
+        environment["LD_LIBRARY_PATH"] = harness["library_path"]
     result = subprocess.run(command_for(harness, stem, iterations, budget),
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, check=False,
+                            env=environment)
     if result.returncode != 0:
         raise SystemExit("%s on %s failed: %s"
                          % (harness["label"], stem, result.stderr.strip()))
+    # A value may contain spaces ("error=truncated stream"), so split on the
+    # next ` key=` boundary rather than on whitespace. Splitting on whitespace
+    # silently truncated that field to "truncated" and left "stream" as a
+    # stray token, which made every invalid-input row fail its own check.
     fields = {}
-    for token in result.stdout.split():
-        key, _, value = token.partition("=")
-        fields[key] = value
+    for match in re.finditer(r"(\w+)=(.*?)(?=\s+\w+=|\s*$)", result.stdout,
+                             re.DOTALL):
+        fields[match.group(1)] = match.group(2).strip()
     return fields
 
 
@@ -726,7 +827,78 @@ def dispersion(samples):
     }
 
 
-def plan(manifest, samples, warmup):
+def bootstrap_median_ci(values, resamples=10000, seed=20261107):
+    """A percentile interval for the median of `values`.
+
+    The ratios are not assumed normal, and there are only as many of them as
+    there were rounds, so the interval is bootstrapped rather than taken from a
+    t distribution. The seed is fixed so the interval is reproducible.
+    """
+    import random
+    if not values:
+        return None, None
+    ordered = sorted(values)
+    median = statistics.median(ordered)
+    if len(ordered) < 3:
+        return median, None
+    generator = random.Random(seed)
+    medians = []
+    for _ in range(resamples):
+        draw = [ordered[generator.randrange(len(ordered))]
+                for _ in range(len(ordered))]
+        medians.append(statistics.median(draw))
+    medians.sort()
+    low = medians[int(0.025 * (len(medians) - 1))]
+    high = medians[int(0.975 * (len(medians) - 1))]
+    return median, [low, high]
+
+
+def paired_ratios(observations, comparable):
+    """Ratios between two rows, paired by round.
+
+    Every row runs once per round, so round `r` of row A and round `r` of row B
+    were taken under the same conditions and can be divided. That is the whole
+    point of keeping the acquisition order: an unpaired comparison of two
+    medians cannot tell a real difference from a drift that happened to land
+    between them.
+
+    Only rows that declare the same contract are paired. A ratio against a row
+    with a looser contract would be a number without a meaning.
+    """
+    by_input = {}
+    for record in observations:
+        by_input.setdefault(record["input"], {}).setdefault(
+            record["harness"], {})[record["round"]] = record["ns_per_call"]
+    results = []
+    for input_name, per_harness in sorted(by_input.items()):
+        labels = [label for label in per_harness if comparable.get(label)]
+        for left in labels:
+            for right in labels:
+                if left == right:
+                    continue
+                shared = sorted(set(per_harness[left]) & set(per_harness[right]))
+                if len(shared) < 3:
+                    continue
+                ratios = [per_harness[left][r] / per_harness[right][r]
+                          for r in shared]
+                median, interval = bootstrap_median_ci(ratios)
+                results.append({
+                    "input": input_name,
+                    "numerator": left,
+                    "denominator": right,
+                    "rounds": len(shared),
+                    "median_ratio": round(median, 4),
+                    "ci95": [round(interval[0], 4), round(interval[1], 4)]
+                            if interval else None,
+                    "rounds_numerator_faster": sum(1 for value in ratios
+                                                   if value < 1.0),
+                    "min_ratio": round(min(ratios), 4),
+                    "max_ratio": round(max(ratios), 4),
+                })
+    return results
+
+
+def plan(manifest, samples, warmup, budget_mode="exact", headroom=16777216):
     lines = []
     total_calls = 0
     valid_payload_bytes = 0
@@ -734,8 +906,9 @@ def plan(manifest, samples, warmup):
     for entry in manifest["inputs"]:
         stem = entry["name"]
         iterations = measure.ITERATIONS[stem.split("-")[0]]
+        budget = budget_for(entry, budget_mode, headroom)
         for harness in HARNESSES:
-            arguments = command_for(harness, stem, iterations, entry["plain_bytes"])
+            arguments = command_for(harness, stem, iterations, budget)
             lines.append(" ".join(arguments))
             total_calls += (samples + warmup) * iterations
             valid_payload_bytes += ((samples + warmup) * iterations *
@@ -847,6 +1020,18 @@ def main():
                              "exclusive flock on this path for the whole run")
     parser.add_argument("--lock-timeout", type=float, default=3600.0,
                         help="seconds to wait for --lock-file")
+    parser.add_argument("--budget-mode", choices=("exact", "headroom"),
+                        default="exact",
+                        help="exact: the output budget equals the payload, the "
+                             "tightest case. headroom: one fixed budget far "
+                             "above every payload, which is what a caller that "
+                             "does not know the size does")
+    parser.add_argument("--headroom-bytes", type=int, default=16777216,
+                        help="the budget used by --budget-mode headroom")
+    parser.add_argument("--inputs", default=None,
+                        help="comma-separated input stems to measure, for "
+                             "splitting a long campaign into bounded runs; "
+                             "the default is every input")
     parser.add_argument("--goose", default=".toolchain/goose/build/goose")
     parser.add_argument("--cc", default="cc")
     arguments = parser.parse_args()
@@ -858,10 +1043,21 @@ def main():
 
     manifest = measure.prepare()
     print("prepared %d inputs in %s" % (len(manifest["inputs"]), INPUTS))
+    if arguments.inputs:
+        wanted = [name.strip() for name in arguments.inputs.split(",") if name.strip()]
+        known = {entry["name"] for entry in manifest["inputs"]}
+        unknown = [name for name in wanted if name not in known]
+        if unknown:
+            raise SystemExit("unknown input(s): " + ", ".join(unknown))
+        manifest["inputs"] = [entry for entry in manifest["inputs"]
+                              if entry["name"] in wanted]
+        print("measuring %d of them: %s"
+              % (len(manifest["inputs"]), ", ".join(wanted)))
 
     if arguments.plan:
         lines, total_calls, payload_bytes, rejection_calls = plan(
-            manifest, arguments.samples, arguments.warmup)
+            manifest, arguments.samples, arguments.warmup,
+            arguments.budget_mode, arguments.headroom_bytes)
         print("%d invocations, %d decode calls in total"
               % (len(lines) * (arguments.samples + arguments.warmup), total_calls))
         print("%.1f GiB valid payload bytes; %d invalid-input rejection calls"
@@ -894,6 +1090,9 @@ def main():
     for harness in list(HARNESSES):
         path = pathlib.Path(harness["path"]) if harness.get("path") \
             else BUILD / harness["binary"]
+        if harness.get("requires") and not pathlib.Path(
+                harness["requires"]).is_file():
+            path = pathlib.Path(harness["requires"])
         if not path.is_file():
             HARNESSES.remove(harness)
             skipped_rows.append({"label": harness["label"],
@@ -1007,14 +1206,23 @@ def main():
 
     before = snapshot(goose_path, arguments.cc, affinity_allowed, affinity_cpu)
     rows = []
+    # Every observation, in the order it was taken. `dispersion()` sorts, which
+    # is right for a distribution and wrong for pairing: once the order is gone
+    # the round-to-round drift cannot be separated from the difference between
+    # two rows. These records keep fixture, round, position in the round,
+    # implementation, iteration count and the unrounded total, so a paired
+    # ratio can be computed afterwards instead of assumed.
+    observations = []
     # Per-round observation of the sample loop itself. The endpoint checks
     # bracket the run; this is what says whether a transient landed inside it.
     round_seconds = []
     round_switches = []
+    round_children_switches = []
     for entry in manifest["inputs"]:
         stem = entry["name"]
         iterations = measure.ITERATIONS[stem.split("-")[0]]
-        budget = entry["plain_bytes"]
+        budget = budget_for(entry, arguments.budget_mode,
+                            arguments.headroom_bytes)
         collected = {harness["label"]: [] for harness in HARNESSES}
         memory = {harness["label"]: [] for harness in HARNESSES}
         # Alternating order: each round starts one harness later, so a slow
@@ -1025,8 +1233,9 @@ def main():
             order = HARNESSES[shift:] + HARNESSES[:shift]
             import time
             round_start = time.monotonic()
-            switches_start = context_switches()
-            for harness in order:
+            switches_start = runner_context_switches()
+            children_start = children_context_switches()
+            for position, harness in enumerate(order):
                 fields = run_once(harness, stem, iterations, budget)
                 if int(fields["output"]) != entry["plain_bytes"]:
                     raise SystemExit("%s on %s: wrong output length"
@@ -1036,15 +1245,32 @@ def main():
                                      % (harness["label"], stem))
                 if round_index < arguments.warmup:
                     continue
+                total_ns = int(fields["total_ns"])
                 collected[harness["label"]].append(int(fields["per_call_ns"]))
+                observations.append({
+                    "input": stem,
+                    "round": round_index - arguments.warmup,
+                    "position": position,
+                    "harness": harness["label"],
+                    "iterations": iterations,
+                    "total_ns": total_ns,
+                    # The unrounded per-call time. `per_call_ns` in the row is
+                    # the harness's own integer division; this is the value the
+                    # paired ratios are computed from.
+                    "ns_per_call": total_ns / iterations,
+                })
                 if "peak_rss_kb" in fields:
                     memory[harness["label"]].append(int(fields["peak_rss_kb"]))
             if round_index >= arguments.warmup:
                 round_seconds.append(time.monotonic() - round_start)
-                switches_end = context_switches()
+                switches_end = runner_context_switches()
                 round_switches.append(
                     switches_end.get("nonvoluntary", 0) -
                     switches_start.get("nonvoluntary", 0))
+                children_end = children_context_switches()
+                round_children_switches.append(
+                    children_end.get("nonvoluntary", 0) -
+                    children_start.get("nonvoluntary", 0))
         for harness in HARNESSES:
             samples = collected[harness["label"]]
             if len(samples) != arguments.samples:
@@ -1088,9 +1314,24 @@ def main():
             "max_round_s": round(ordered_rounds[-1], 4),
             "min_round_s": round(ordered_rounds[0], 4),
             "outlier_rounds": outliers,
-            "nonvoluntary_switches_per_round": round_switches,
-            "nonvoluntary_switches_total": sum(round_switches),
-            "clean": not outliers,
+            # A round that took much longer than the median round is a coarse
+            # signal: it catches a transient big enough to move the whole
+            # round, and it says nothing about a short disturbance that landed
+            # inside one implementation's slice. The name says what it is.
+            "no_large_round_outliers": not outliers,
+            # The timed binaries' own switches, from RUSAGE_CHILDREN deltas.
+            # Children run strictly one at a time, so a round's delta belongs
+            # to that round.
+            "children_nonvoluntary_switches_per_round":
+                round_children_switches,
+            "children_nonvoluntary_switches_total":
+                sum(round_children_switches),
+            "children_nonvoluntary_switches_max":
+                max(round_children_switches) if round_children_switches else 0,
+            # The runner's own counters, kept because they describe the driver.
+            # They are not the children's and must not be read as such.
+            "runner_nonvoluntary_switches_per_round": round_switches,
+            "runner_nonvoluntary_switches_total": sum(round_switches),
         }
         if outliers:
             print("WARNING: %d sample round(s) took more than 1.5x the median "
@@ -1136,10 +1377,20 @@ def main():
         },
         "method": {
             "samples": arguments.samples,
+            "budget_mode": arguments.budget_mode,
+            "headroom_bytes": (arguments.headroom_bytes
+                               if arguments.budget_mode == "headroom" else None),
             "warmup_rounds": arguments.warmup,
             "order": "alternating: each round starts one harness later",
             "timing": "CLOCK_MONOTONIC around the call loop, one warm-up call outside it",
             "statistic": "median with min/max/stdev/MAD/p90/p99/IQR over the raw samples",
+            "pairing": "every observation is kept in acquisition order in "
+                       "<output>.observations.jsonl with fixture, round, "
+                       "position, implementation, iterations and total_ns; "
+                       "`paired` divides two rows round by round and reports "
+                       "the median ratio with a bootstrap 95% interval. The "
+                       "sorted `samples` lists in `rows` are kept for "
+                       "compatibility and cannot be re-paired",
             "verification": "every sample must report the expected output length and FNV-1a",
             "memory": "peak RSS read from /proc/self/status VmHWM by the harness",
             "affinity": "all measured child processes inherit one selected allowed CPU",
@@ -1157,10 +1408,23 @@ def main():
         "inputs": manifest["inputs"],
         "skipped_rows": skipped_rows,
         "rows": rows,
+        "paired": paired_ratios(
+            observations,
+            {harness["label"]: harness["comparable"] for harness in HARNESSES}),
+        "observations_file": str(
+            pathlib.Path(arguments.output).with_suffix(".observations.jsonl")),
     }
     pathlib.Path(arguments.output).write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n")
+    # The raw observations, one JSON object per line, in acquisition order.
+    # `rows[].per_call_ns.samples` stays sorted for compatibility; this file is
+    # what a paired or drift analysis has to be computed from.
+    with open(report["observations_file"], "w") as handle:
+        for record in observations:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
     print("wrote %s" % arguments.output)
+    print("wrote %s (%d observations)"
+          % (report["observations_file"], len(observations)))
     if not report["stable"]:
         print("WARNING: provenance changed during the run; the samples are suspect")
         return 1

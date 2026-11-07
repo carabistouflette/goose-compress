@@ -115,9 +115,25 @@ load average of 0.0 says nothing about a job that started after the check. So
    `contention.endpoint_checks_passed`.
 
 The endpoint checks bracket the run; they do not prove the machine was quiet in
-between. What covers the middle is `contention.sample_phase`: the duration of
-every sample round and the involuntary context switches it took, so a transient
-that landed inside the loop is visible in the report rather than assumed away.
+between. What covers the middle is `contention.sample_phase`, and each field
+there says exactly what it measures:
+
+- `no_large_round_outliers` is true when no sample round took more than 1.5x
+  the median round. That is a coarse signal: it catches a transient big enough
+  to move a whole round, and it says nothing about a short disturbance that
+  landed inside one implementation's slice. It is not a claim that the run was
+  undisturbed.
+- `children_nonvoluntary_switches_per_round` is the involuntary context-switch
+  count of the timed binaries, taken as a difference of
+  `getrusage(RUSAGE_CHILDREN)`. The sample loop runs one child at a time and
+  waits for each, so a round's delta belongs to that round's children. The
+  absolute value includes the switches inherent in spawning and reaping a
+  process, so the signal is the variation across rounds, not the level: a round
+  far above its neighbours is a round that was descheduled.
+- `runner_nonvoluntary_switches_per_round` is the same counter for the Python
+  driver, read from `/proc/self/status`. It describes the driver, not the
+  binaries, and is kept only because it is cheap and occasionally useful.
+
 A refused run is written to `<output>.rejected.json` with the raw contention
 observation, so a rejection is evidence and not a deleted attempt.
 
