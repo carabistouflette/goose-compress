@@ -20,7 +20,7 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
            tests/differential.goose examples/artifact_payload.goose
 
 .PHONY: setup format check fixtures corpus native test sanitize sanitize-negative \
-        bench bench-build bench-run clean
+        bench bench-build bench-run baseline baseline-verify clean
 
 setup:
 	./scripts/setup-goose.sh
@@ -96,6 +96,21 @@ bench-build: fixtures
 bench-run: bench-build
 	python3 bench/measure.py --goose "$(GOOSE)" --cc $(BENCH_CC) \
 		--output .build/benchmark.json
+
+# Freezes the identity of the tree before the runtime is touched. Each variant
+# is compiled into its own directory and archived once, so a later build cannot
+# overwrite the bytes a hash describes. BASELINE_LABEL must be new every time.
+BASELINE_LABEL ?= baseline
+baseline:
+	python3 scripts/baseline-manifest.py --goose "$(GOOSE)"
+	python3 scripts/baseline-archive.py --goose "$(GOOSE)" --label "$(BASELINE_LABEL)"
+	python3 scripts/baseline-status.py
+
+baseline-verify:
+	python3 scripts/baseline-manifest.py --goose "$(GOOSE)" --check
+	python3 scripts/baseline-archive.py --verify \
+		".build/baseline/archive/$$(python3 -c 'import json;print(json.load(open(".build/baseline/STATUS.json"))["authoritative_archive"])')"
+	python3 scripts/baseline-status.py --check
 
 clean:
 	rm -rf .build
