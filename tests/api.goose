@@ -160,6 +160,41 @@ fn main() {
         failures += 1;
     }
 
+    // The registry is a system resource, separate from stream budgets.
+    var held: compress::Decoder[>..] = [];
+    for i in 32 {
+        var slot = compress::Decoder { .. };
+        if compress::open(slot, compress::Format.Raw, defaults) == compress::Error.None {
+            held.push(slot);
+        }
+    }
+    if held.len != 32 || compress::abi().live != 32 {
+        write_stderr("api: the registry must hold 32 decoders\n");
+        failures += 1;
+    }
+    var extra = compress::Decoder { .. };
+    if compress::open(extra, compress::Format.Raw, defaults) != compress::Error.SystemError ||
+       extra.handle != 0 || extra.progress.state != compress::State.Idle ||
+       compress::abi().live != 32 {
+        write_stderr("api: the 33rd open must return SystemError without a handle\n");
+        failures += 1;
+    }
+    for i in held.len {
+        if compress::close(held[i]) != compress::Error.None {
+            write_stderr("api: a held decoder must close\n");
+            failures += 1;
+        }
+    }
+    if compress::open(extra, compress::Format.Raw, defaults) != compress::Error.None ||
+       compress::abi().live != 1 {
+        write_stderr("api: a slot must be reusable after exhaustion\n");
+        failures += 1;
+    }
+    if compress::close(extra) != compress::Error.None || compress::abi().live != 0 {
+        write_stderr("api: exhaustion recovery must not leak a decoder\n");
+        failures += 1;
+    }
+
     // Every error and state has a name, and the ABI report is populated.
     let names = [
         compress::Error.None, compress::Error.InvalidInput, compress::Error.LimitExceeded,
