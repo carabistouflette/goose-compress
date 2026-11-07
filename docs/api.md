@@ -175,10 +175,28 @@ Stable lowercase names, used by the tests and the example.
 
 ## The chunking guarantee
 
-For a fixed `Limits`, the returned error, the produced bytes and
-`progress.consumed` do not depend on how the caller splits its input into
+For a fixed `Limits`, the returned error, the produced bytes, `progress.members`
+and `progress.trailing` do not depend on how the caller splits its input into
 `feed` calls. `tests/boundaries.goose` asserts this for chunk sizes 1, 2, 3, 7,
 64, 1024 and 65536 over all 48 fixtures, plus the exact-boundary and zero cases.
+
+`progress.consumed` is invariant under the same split **except in one case**:
+when the call stops with `Error.LimitExceeded` because `limits.output_bytes` was
+reached. There `consumed` reports the input the failing step had available, so
+it varies with the chunking. This is not a defect that can be fixed in the
+runtime: `feed` cannot know how many compressed bytes produce exactly the
+remaining output without decoding them, and decoding them would append bytes
+past the budget. The exact rule, asserted by `tests/contract.goose`, is:
+
+- `produced == limits.output_bytes` exactly, and
+- `consumed <= limits.input_bytes` and `consumed <= input.len`.
+
+Everywhere else — including the input-budget stop, a malformed stream, a
+trailing-data refusal and a clean end — `consumed` is identical for every
+chunking. Measured on the 44-byte `gzip-text` fixture with a 168-byte payload:
+`consumed` is 12..13 at `output_bytes = 0`, 13..14 at 1, 16..17 at 4, 28..29 at
+16, and a stable 35 at 64 and 100, while the error, the produced bytes, the
+member count and the trailing count stay fixed throughout.
 
 Two consequences are worth stating because they are easy to get wrong:
 

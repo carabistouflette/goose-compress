@@ -31,8 +31,15 @@ generation counter is capped at `0x7FFFFFFFFFFF`; a slot that reaches the cap
 is retired rather than wrapped, so a handle can never be reused.
 
 The table is a fixed array, so `open` has no allocation of its own beyond the
-`z_stream` and its window. A 33rd concurrent decoder returns `GC_LIMIT`, which
-the Goose layer maps to `Error.SystemError`.
+`z_stream` and its window. A 33rd concurrent decoder returns `Error.SystemError`.
+
+**Known defect, blocking.** The adapter's table-full branch currently sets
+`meta.data[0] = GC_LIMIT`, and `to_error(2)` is `Error.LimitExceeded`, so the
+33rd `open` returns `LimitExceeded` instead of the promised `SystemError`.
+Reproduced in `.build/probe/limit.goose` and asserted by `tests/contract.goose`,
+which fails until `gc_open` sets `GC_SYSTEM` there. The fix is one line in
+`native/compress.c` and is held back until the frozen baseline reference window
+closes.
 
 ## Output budget and the one-byte sentinel
 
@@ -77,6 +84,12 @@ over    = usable < input.len
 `over` is remembered and turned into `LimitExceeded` after the prefix has been
 decoded. The result is that `consumed`, `produced` and the error are the same
 for every chunking of the same bytes.
+
+That invariance is specific to the input-budget path. When the *output* budget
+is what stops the call, `consumed` reports the input the failing step had
+available and therefore varies with the chunking; `docs/api.md` states the
+exact rule and `tests/contract.goose` asserts it. The runtime cannot do better
+without decoding bytes it is not allowed to append.
 
 Bytes accepted after the last member under `Trailing.Allow` also count against
 `input_bytes` and are added to `consumed`. They are input the caller supplied,

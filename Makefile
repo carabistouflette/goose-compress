@@ -17,7 +17,8 @@ SANITIZE_LIBS = -lz -lpthread -lm -ldl
 SANITIZE_ENV = ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1
 
 PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
-           tests/differential.goose examples/artifact_payload.goose
+           tests/contract.goose tests/differential.goose \
+           examples/artifact_payload.goose
 
 .PHONY: setup format check fixtures corpus native test sanitize sanitize-negative \
         bench bench-build bench-run baseline baseline-verify clean
@@ -35,6 +36,7 @@ check:
 	"$(GOOSE)" check tests/spec.goose
 	"$(GOOSE)" check tests/boundaries.goose
 	"$(GOOSE)" check tests/api.goose
+	"$(GOOSE)" check tests/contract.goose
 	"$(GOOSE)" check tests/differential.goose
 	"$(GOOSE)" check examples/artifact_payload.goose
 	"$(GOOSE)" check bench/bench.goose
@@ -56,6 +58,7 @@ test: fixtures corpus native
 	"$(GOOSE)" run tests/spec.goose
 	"$(GOOSE)" run tests/boundaries.goose
 	"$(GOOSE)" run tests/api.goose
+	"$(GOOSE)" run tests/contract.goose
 	"$(GOOSE)" run tests/differential.goose
 	"$(GOOSE)" build tests/api.goose --cc $(CC) -O2 -o .build/api
 	./.build/api
@@ -68,7 +71,7 @@ sanitize: fixtures
 	mkdir -p .build
 	$(SANITIZER) $(SANITIZE_FLAGS) -o .build/driver-sanitize tests/driver.c $(NATIVE) $(SANITIZE_LIBS)
 	$(SANITIZE_ENV) ./.build/driver-sanitize --selftest
-	@for target in spec boundaries api differential; do \
+	@for target in spec boundaries api contract differential; do \
 		echo "sanitize: $$target"; \
 		"$(GOOSE)" tests/$$target.goose --standalone --debug --no-bce \
 			-o .build/$$target-sanitized.c || exit $$?; \
@@ -94,7 +97,7 @@ bench-build: fixtures
 		-o .build/libdeflate-oneshot
 
 bench-run: bench-build
-	python3 bench/measure.py --goose "$(GOOSE)" --cc $(BENCH_CC) \
+	python3 bench/runner.py --goose "$(GOOSE)" --cc $(BENCH_CC) \
 		--output .build/benchmark.json
 
 # Freezes the identity of the tree before the runtime is touched. Each variant
