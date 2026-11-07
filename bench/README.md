@@ -1,8 +1,10 @@
 # Benchmark harness
 
-Seven rows, one contract each, and a reported output length plus FNV-1a digest
-that must match across every row that decodes the same payload. A row that did
-less work is rejected rather than reported.
+Seven rows measure valid payloads under the contracts below. Two additional
+Goose-only rows measure rejection of a truncated stream and a bad gzip
+checksum. Valid rows must match the fixture output length and FNV-1a digest;
+rejection rows must return the specified error and keep the same produced
+length and digest across samples.
 
 ```
 bench/
@@ -26,6 +28,10 @@ bench/
 | zlib oneshot | unbounded: no budgets, no trailing check | reused | **no** |
 | libdeflate oneshot | unbounded: no budgets, no trailing check | reused | **no** |
 
+The two invalid-input rows are deliberately non-comparable. They measure the
+bounded library's rejection path; the one-shot references do not provide the
+same resource-limit contract.
+
 `zlib bounded` is the same zlib under the same framing policy, so a difference
 there is the cost of the bounded incremental state machine, not a speed
 ranking. `libdeflate oneshot` is a throughput reference: it is one-shot and
@@ -35,38 +41,46 @@ state-of-the-art claim.
 ## Build
 
 ```sh
-make bench
+GOOSE=/path/to/pinned/goose make bench
 ```
 
-Compiles the four binaries into `.build/` and writes the deterministic inputs
-to `.build/bench-inputs/`. It measures nothing.
+Compiles the four binaries into `.build/` and writes eight valid fixtures plus
+the truncated-stream and bad-checksum inputs to `.build/bench-inputs/`. It
+measures nothing.
 
 ## Plan, without timing
 
 ```sh
-make bench-plan
+GOOSE=/path/to/pinned/goose make bench-plan
 ```
 
-Prints every command, the input set, the invocation count and the total decode
-volume. Nothing is executed.
+Prints every command, the input set, the invocation count, valid payload volume
+and rejection call count. Nothing is timed.
 
 ## Run
 
 ```sh
-make bench-run
+GOOSE=/path/to/pinned/goose make bench-run
 ```
 
 or directly:
 
 ```sh
-python3 bench/runner.py --samples 20 --output .build/benchmark.json
+python3 bench/runner.py --goose /path/to/pinned/goose --samples 20 \
+  --output .build/benchmark.json
 ```
 
 The runner keeps every raw sample, alternates the harness order each round so
-slow drift lands on all rows, discards two warm-up rounds, and reports
-min/max/median/mean/stdev/MAD/p90/p99/IQR plus peak RSS. It records provenance
-before and after the run and fails if the two differ. It refuses to start when
-the 1-minute load average is above `--max-load` (default 0.5).
+slow drift lands on all rows, pins the child processes to one allowed CPU,
+discards two warm-up rounds, and reports min/max/median/mean/stdev/MAD/p90/p99/
+IQR plus peak RSS. It records the Goose and C compiler paths, versions and
+binary hashes; measured source and benchmark binary hashes; resolved shared
+library paths and hashes; compiler flags; git state; CPU model/governor and
+load average before and after. Load average is recorded but excluded from the
+static-identity comparison because the benchmark itself changes it. The runner
+refuses to start when the 1-minute load average is above `--max-load` (default
+0.5), and rejects a run if compiler, source, binary, dependency or other static
+identity changes.
 
 Run it alone. Concurrent work on the same CPU makes every row meaningless.
 
@@ -108,5 +122,4 @@ Writes `.build/bench-inputs/` and `inputs.json` without running anything.
 - No cross-library ranking. Only rows marked comparable share a contract.
 - No timing thresholds in CI. CI builds the harness and checks that it runs;
   it does not assert a speed.
-- No `hyperfine`, no `perf`, no CPU pinning. Those would be a separate,
-  documented methodology.
+- Local measurements are descriptive, not a CI performance promise.

@@ -26,6 +26,7 @@ import json
 import os
 import pathlib
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -107,6 +108,29 @@ HARNESSES = [
 ]
 
 BINARIES = ["bench", "zlib-bounded", "zlib-oneshot", "libdeflate-oneshot"]
+INVALID_HARNESS = {
+    "label": "goose-compress invalid",
+    "binary": "bench",
+    "mode": "invalid",
+    "contract": "bounded: rejects a truncated stream or bad gzip checksum",
+    "buffer": "reused across calls",
+    "comparable": False,
+    "role": "error-path timing only; no equal-contract competitor row",
+}
+
+SOURCE_FILES = [
+    "GOOSE_REVISION",
+    "compress.goose",
+    "compress.build",
+    "native/compress.c",
+    "native/compress.h",
+    "bench/bench.goose",
+    "bench/runner.py",
+    "bench/measure.py",
+    "bench/compare/zlib_bounded.c",
+    "bench/compare/zlib_oneshot.c",
+    "bench/compare/libdeflate_oneshot.c",
+]
 
 
 def sha256_file(path):
@@ -115,6 +139,63 @@ def sha256_file(path):
         for block in iter(lambda: handle.read(1 << 20), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def command_info(command):
+    """Resolve and identify a compiler executable without shell expansion."""
+    resolved = shutil.which(command)
+    if resolved is None:
+        candidate = pathlib.Path(command)
+        if not candidate.is_absolute():
+            candidate = ROOT / candidate
+        resolved = str(candidate.resolve())
+    path = pathlib.Path(resolved).resolve()
+    if not path.is_file():
+        raise SystemExit("compiler binary is missing: " + str(path))
+    version = subprocess.run([str(path), "--version"], capture_output=True,
+                             text=True, check=False).stdout.splitlines()
+    if not version:
+        raise SystemExit("compiler version is unavailable: " + str(path))
+    return {
+        "path": str(path),
+        "sha256": sha256_file(path),
+        "version": version[0].strip() if version else "unknown",
+    }
+
+
+def linked_dependencies(binary):
+    """Record resolved shared-library paths and bytes, not ASLR addresses."""
+    try:
+        result = subprocess.run(["ldd", str(binary)], capture_output=True,
+                                text=True, check=False)
+    except OSError as error:
+        return {"error": str(error)}
+    if result.returncode != 0:
+        return {"error": result.stderr.strip() or "ldd failed"}
+
+    dependencies = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if "=>" in fields:
+            arrow = fields.index("=>")
+            name = " ".join(fields[:arrow])
+            if arrow + 1 >= len(fields) or fields[arrow + 1] == "not":
+                dependencies[name] = {"path": None, "sha256": None}
+                continue
+            resolved = fields[arrow + 1]
+        elif fields[0].startswith("/"):
+            resolved = fields[0]
+            name = pathlib.Path(resolved).name
+        else:
+            continue
+        path = pathlib.Path(resolved).resolve()
+        dependencies[name] = {
+            "path": str(path),
+            "sha256": sha256_file(path) if path.is_file() else None,
+        }
+    return dependencies
 
 
 def load_average():
@@ -132,22 +213,56 @@ def cpu_governor():
         return "unknown"
 
 
-def snapshot():
+def snapshot(goose_path, cc, affinity_allowed, affinity_cpu):
     """Everything that could change between the first and the last sample."""
+    goose_binary = pathlib.Path(goose_path).resolve()
+    cc_info = command_info(cc)
+    source_hashes = {
+        name: sha256_file(ROOT / name)
+        for name in SOURCE_FILES if (ROOT / name).is_file()
+    }
     return {
         "load_average": list(load_average()),
         "cpu_governor": cpu_governor(),
+        "cpu_affinity_allowed_before_pin": affinity_allowed,
+        "cpu_affinity_selected": affinity_cpu,
+        "goose_compiler": {
+            "path": str(goose_binary),
+            "sha256": sha256_file(goose_binary) if goose_binary.is_file() else None,
+            "revision": (ROOT / "GOOSE_REVISION").read_text().strip(),
+        },
+        "c_compiler": cc_info,
+        "build_flags": {
+            "goose": ["build", "bench/bench.goose", "--cc", cc, "-O2"],
+            "c": ["-std=c11", "-Wall", "-Wextra", "-Werror", "-O2"],
+        },
+        "source_sha256": source_hashes,
         "binaries": {name: sha256_file(BUILD / name)
                      for name in BINARIES if (BUILD / name).is_file()},
+        "shared_dependencies": {
+            name: linked_dependencies(BUILD / name)
+            for name in BINARIES if (BUILD / name).is_file()
+        },
         "runtime": {name: sha256_file(ROOT / name)
                     for name in ("compress.goose", "native/compress.c")
                     if (ROOT / name).is_file()},
         "git_head": subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                                    capture_output=True, text=True).stdout.strip(),
-        "git_dirty": bool(subprocess.run(["git", "status", "--porcelain"],
-                                         cwd=ROOT, capture_output=True,
-                                         text=True).stdout.strip()),
+        "git_status": subprocess.run(["git", "status", "--porcelain=v1", "-uall"],
+                                      cwd=ROOT, capture_output=True,
+                                      text=True).stdout.splitlines(),
     }
+
+
+def stable_snapshot(snapshot):
+    """Load average is an observation, not immutable build provenance.
+
+    The benchmark itself changes load average, so comparing that field would
+    reject an uncontended run. Keep it in both snapshots while comparing all
+    compiler, source, binary, dependency and platform identity fields.
+    """
+    return {key: value for key, value in snapshot.items()
+            if key != "load_average"}
 
 
 def command_for(harness, stem, iterations, budget):
@@ -196,6 +311,8 @@ def dispersion(samples):
 def plan(manifest, samples, warmup):
     lines = []
     total_calls = 0
+    valid_payload_bytes = 0
+    rejection_calls = 0
     for entry in manifest["inputs"]:
         stem = entry["name"]
         iterations = measure.ITERATIONS[stem.split("-")[0]]
@@ -203,7 +320,66 @@ def plan(manifest, samples, warmup):
             arguments = command_for(harness, stem, iterations, entry["plain_bytes"])
             lines.append(" ".join(arguments))
             total_calls += (samples + warmup) * iterations
-    return lines, total_calls
+            valid_payload_bytes += ((samples + warmup) * iterations *
+                                    entry["plain_bytes"])
+    for entry in manifest.get("invalid", []):
+        stem = pathlib.Path(entry["name"]).stem
+        iterations = 200
+        lines.append(" ".join(command_for(
+            INVALID_HARNESS, stem, iterations, 1 << 20)))
+        total_calls += (samples + warmup) * iterations
+        rejection_calls += (samples + warmup) * iterations
+    return lines, total_calls, valid_payload_bytes, rejection_calls
+
+
+def invalid_rows(manifest, samples, warmup):
+    """Measure rejection paths separately; they have no fair competitor row."""
+    rows = []
+    for entry in manifest.get("invalid", []):
+        stem = pathlib.Path(entry["name"]).stem
+        iterations = 200
+        budget = 1 << 20
+        input_path = INPUTS / entry["name"]
+        timings = []
+        rss = []
+        content = None
+        error = entry["error"]
+        for round_index in range(samples + warmup):
+            fields = run_once(INVALID_HARNESS, stem, iterations, budget)
+            if fields.get("error") != error:
+                raise SystemExit("%s: expected %s, got %s" %
+                                 (entry["name"], error, fields.get("error")))
+            observed = (int(fields["output"]), int(fields["fnv1a"]))
+            if content is None:
+                content = observed
+            elif observed != content:
+                raise SystemExit("%s: rejected output changed between samples" %
+                                 entry["name"])
+            if round_index >= warmup:
+                timings.append(int(fields["per_call_ns"]))
+                if "peak_rss_kb" in fields:
+                    rss.append(int(fields["peak_rss_kb"]))
+        row = {
+            "input": entry["name"],
+            "compressed_bytes": input_path.stat().st_size,
+            "input_sha256": sha256_file(input_path),
+            "output_bytes": content[0],
+            "iterations": iterations,
+            "harness": INVALID_HARNESS["label"],
+            "contract": INVALID_HARNESS["contract"],
+            "buffer": INVALID_HARNESS["buffer"],
+            "comparable": False,
+            "role": INVALID_HARNESS["role"],
+            "error": error,
+            "fnv1a": content[1],
+            "per_call_ns": dispersion(timings),
+            "command": " ".join(command_for(
+                INVALID_HARNESS, stem, iterations, budget)),
+        }
+        if rss:
+            row["peak_rss_kb"] = dispersion(rss)
+        rows.append(row)
+    return rows
 
 
 def main():
@@ -223,14 +399,19 @@ def main():
 
     if arguments.samples < 20:
         raise SystemExit("--samples must be at least 20; fewer cannot show a tail")
+    if arguments.warmup < 1:
+        raise SystemExit("--warmup must be at least 1")
 
     manifest = measure.prepare()
     print("prepared %d inputs in %s" % (len(manifest["inputs"]), INPUTS))
 
     if arguments.plan:
-        lines, total_calls = plan(manifest, arguments.samples, arguments.warmup)
+        lines, total_calls, payload_bytes, rejection_calls = plan(
+            manifest, arguments.samples, arguments.warmup)
         print("%d invocations, %d decode calls in total"
               % (len(lines) * (arguments.samples + arguments.warmup), total_calls))
+        print("%.1f GiB valid payload bytes; %d invalid-input rejection calls"
+              % (payload_bytes / (1 << 30), rejection_calls))
         for line in lines:
             print(line)
         print("plan only: nothing was timed")
@@ -249,7 +430,19 @@ def main():
         raise SystemExit("load average %.2f is above --max-load %.2f; "
                          "run this alone" % (load, arguments.max_load))
 
-    before = snapshot()
+    goose_path = pathlib.Path(arguments.goose)
+    if not goose_path.is_absolute():
+        goose_path = ROOT / goose_path
+    goose_path = goose_path.resolve()
+    try:
+        affinity_allowed = sorted(os.sched_getaffinity(0))
+        affinity_cpu = affinity_allowed[0]
+        os.sched_setaffinity(0, {affinity_cpu})
+    except (AttributeError, OSError, IndexError):
+        affinity_allowed = None
+        affinity_cpu = None
+
+    before = snapshot(goose_path, arguments.cc, affinity_allowed, affinity_cpu)
     rows = []
     for entry in manifest["inputs"]:
         stem = entry["name"]
@@ -300,12 +493,14 @@ def main():
                 row["peak_rss_kb"] = dispersion(memory[harness["label"]])
             rows.append(row)
 
-    after = snapshot()
+    rows.extend(invalid_rows(manifest, arguments.samples, arguments.warmup))
+
+    after = snapshot(goose_path, arguments.cc, affinity_allowed, affinity_cpu)
     report = {
         "provenance": measure.provenance(),
         "before": before,
         "after": after,
-        "stable": before == after,
+        "stable": stable_snapshot(before) == stable_snapshot(after),
         "method": {
             "samples": arguments.samples,
             "warmup_rounds": arguments.warmup,
@@ -314,6 +509,9 @@ def main():
             "statistic": "median with min/max/stdev/MAD/p90/p99/IQR over the raw samples",
             "verification": "every sample must report the expected output length and FNV-1a",
             "memory": "peak RSS read from /proc/self/status VmHWM by the harness",
+            "affinity": "all measured child processes inherit one selected allowed CPU",
+            "load_average": "recorded before and after; excluded from identity comparison because the run changes it",
+            "toolchain": "Goose and C compiler paths, binary hashes and versions; linked shared-object hashes recorded before and after",
             "ranking": "only rows with comparable=true share a contract; "
                        "libdeflate is a throughput reference and does not rank streaming",
         },
