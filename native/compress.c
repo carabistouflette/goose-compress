@@ -10,7 +10,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
-#include <zlib.h>
+#include "zlib_backend.h"
 
 #if !defined(__linux__)
 #error "goose-compress currently supports Linux only"

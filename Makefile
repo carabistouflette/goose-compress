@@ -22,8 +22,9 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
 
 .PHONY: setup format check fixtures corpus native concurrency concurrency-tsan \
         test sanitize sanitize-negative \
-        bench bench-build bench-competitors bench-zlib14 bench-parity bench-plan \
-        bench-run baseline baseline-verify clean
+        bench bench-build bench-build-ng bench-competitors bench-zlib14 \
+        bench-parity bench-plan bench-run native-ng bench-zlib-ng-compat \
+        baseline baseline-verify clean
 
 setup:
 	./scripts/setup-goose.sh
@@ -61,7 +62,11 @@ native: .build/driver
 # wrap provides in this binary only. The timeout is the backstop for a test that
 # deadlocks: a hang must fail the run, not stall it.
 CONCURRENCY_TIMEOUT ?= 120
-CONCURRENCY_WRAP = -DGC_TEST_WRAP_INFLATE -Wl,--wrap=inflate
+# The close-race check wraps the inflate entry point the adapter actually calls.
+# Against zlib-ng that symbol is `zng_inflate`, so the wrap target follows the
+# backend instead of being hard-coded.
+WRAP_INFLATE ?= inflate
+CONCURRENCY_WRAP = -DGC_TEST_WRAP_INFLATE -Wl,--wrap=$(WRAP_INFLATE)
 
 .build/concurrency: $(NATIVE) native/compress.h tests/concurrency.c
 	mkdir -p .build
@@ -130,6 +135,29 @@ bench-build: fixtures
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_oneshot.c -lz -o .build/zlib-oneshot
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/libdeflate_oneshot.c -ldeflate \
 		-o .build/libdeflate-oneshot
+	$(BENCH_CC) $(CFLAGS) -O2 -Inative bench/compare/goose_adapter.c $(NATIVE) \
+		-lz -lpthread -o .build/goose-adapter
+
+# The same adapter against zlib-ng. This is the only way to time the backend
+# under our own API: `goose build -D` reaches the generated program, not the
+# package's native C, so the Goose-level binary cannot be switched this way.
+bench-build-ng:
+	mkdir -p .build
+	$(BENCH_CC) $(CFLAGS) -O2 -DGC_ZLIB_NG -Inative \
+		bench/compare/goose_adapter.c $(NATIVE) -lz-ng -lz -lpthread \
+		-o .build/goose-adapter-ng
+	./.build/goose-adapter-ng .build/bench-inputs/1KiB-text.gz 10 16777216
+
+# The adapter and the concurrency suite against zlib-ng, with the same guards
+# and the same tests. The driver links both libraries because it builds its own
+# fixtures with zlib's deflate.
+native-ng:
+	$(CC) $(CFLAGS) -O2 -DGC_ZLIB_NG -Inative tests/driver.c $(NATIVE) \
+		-lz-ng -lz -lpthread -o .build/driver-ng
+	./.build/driver-ng --selftest
+	$(CC) $(CFLAGS) -O2 -DGC_ZLIB_NG -Inative tests/concurrency.c $(NATIVE) \
+		-lz-ng -lz -lpthread $(CONCURRENCY_WRAP) -o .build/concurrency-ng
+	timeout $(CONCURRENCY_TIMEOUT) ./.build/concurrency-ng --selftest
 
 # The only other Goose decoder in the catalog, fetched at its pinned commit
 # rather than vendored. Network access is required, so this is opt-in and the
@@ -170,6 +198,36 @@ bench-zlib14:
 	$(BENCH_CC) $(CFLAGS) -O2 -I"$(ZLIB14_DIR)" bench/compare/zlib_bounded.c \
 		"$(ZLIB14_DIR)/libz.a" -o .build/zlib14-bounded
 	./.build/zlib14-bounded --clamp-selftest
+
+# zlib-ng built with -DZLIB_COMPAT: it installs a libz.so.1 with zlib's ABI, so
+# the unchanged Goose binary can be run on it through LD_LIBRARY_PATH. Nothing
+# on the system is replaced; the build is isolated under .build/competitors.
+ZLIB_NG_VERSION ?= 2.3.3
+ZLIB_NG_TARBALL ?= .build/competitors/zlib-ng-$(ZLIB_NG_VERSION).tar.gz
+ZLIB_NG_SHA256 ?= f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1
+ZLIB_NG_DIR ?= .build/competitors/zlib-ng-$(ZLIB_NG_VERSION)
+ZLIB_NG_COMPAT ?= .build/competitors/zlib-ng-compat
+
+bench-zlib-ng-compat:
+	mkdir -p .build/competitors
+	if [ ! -f "$(ZLIB_NG_TARBALL)" ]; then \
+		curl -fsSL -o "$(ZLIB_NG_TARBALL)" \
+			https://github.com/zlib-ng/zlib-ng/archive/refs/tags/$(ZLIB_NG_VERSION).tar.gz; \
+	fi
+	echo "$(ZLIB_NG_SHA256)  $(ZLIB_NG_TARBALL)" | sha256sum -c -
+	rm -rf "$(ZLIB_NG_DIR)" "$(ZLIB_NG_COMPAT)"
+	mkdir -p "$(ZLIB_NG_DIR)"
+	tar xzf "$(ZLIB_NG_TARBALL)" -C "$(ZLIB_NG_DIR)" --strip-components=1
+	cd "$(ZLIB_NG_DIR)" && ./configure --zlib-compat \
+		--prefix="$(CURDIR)/$(ZLIB_NG_COMPAT)" >/dev/null && $(MAKE) -j4 >/dev/null \
+		&& $(MAKE) install >/dev/null
+	$(BENCH_CC) $(CFLAGS) -O2 -I"$(ZLIB_NG_COMPAT)/include" \
+		bench/compare/zlib_bounded.c -L"$(ZLIB_NG_COMPAT)/lib" -lz \
+		-Wl,-rpath,"$(CURDIR)/$(ZLIB_NG_COMPAT)/lib" \
+		-o .build/zlib-ng-compat-bounded
+	LD_LIBRARY_PATH="$(CURDIR)/$(ZLIB_NG_COMPAT)/lib" \
+		./.build/zlib-ng-compat-bounded --clamp-selftest
+	@echo "compat backend: $(CURDIR)/$(ZLIB_NG_COMPAT)/lib/libz.so.1"
 
 # Proves the C reference row implements the same contract as the library before
 # any number from it is used to rank anything.

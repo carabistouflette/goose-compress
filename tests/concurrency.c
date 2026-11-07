@@ -29,7 +29,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <zlib.h>
+
+/* The backend header, not <zlib.h>: against zlib-ng the entry points are
+ * prefixed, and the close-race wrap below has to name the symbol the adapter
+ * really calls. */
+#include "zlib_backend.h"
 
 static int failures;
 static int checks;
@@ -286,16 +290,21 @@ static sem_t g_inflight_entered;
 static sem_t g_inflight_release;
 static int g_wrap_armed;
 
-int __real_inflate(z_stream *stream, int flush);
+/* `--wrap=` takes the linker symbol, so the pair below is pasted from the same
+ * name the backend header maps `inflate` to. */
+#define GC_PASTE_(a, b) a##b
+#define GC_PASTE(a, b) GC_PASTE_(a, b)
 
-int __wrap_inflate(z_stream *stream, int flush) {
+int GC_PASTE(__real_, GC_INFLATE_SYMBOL)(z_stream *stream, int flush);
+
+int GC_PASTE(__wrap_, GC_INFLATE_SYMBOL)(z_stream *stream, int flush) {
     if (__atomic_exchange_n(&g_wrap_armed, 0, __ATOMIC_SEQ_CST)) {
         sem_post(&g_inflight_entered);
         while (sem_wait(&g_inflight_release) != 0) {
             /* EINTR: keep waiting, the test posts exactly once. */
         }
     }
-    return __real_inflate(stream, flush);
+    return GC_PASTE(__real_, GC_INFLATE_SYMBOL)(stream, flush);
 }
 
 static void must_sem_init(sem_t *semaphore) {
