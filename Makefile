@@ -20,7 +20,8 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
            tests/contract.goose tests/differential.goose \
            examples/artifact_payload.goose
 
-.PHONY: setup format check fixtures corpus native test sanitize sanitize-negative \
+.PHONY: setup format check fixtures corpus native concurrency concurrency-tsan \
+        test sanitize sanitize-negative \
         bench bench-build bench-competitors bench-parity bench-plan bench-run \
         baseline baseline-verify clean
 
@@ -56,7 +57,30 @@ corpus:
 native: .build/driver
 	./.build/driver --selftest
 
-test: fixtures corpus native
+# The close-race check needs one real inflate held in flight, which the linker
+# wrap provides in this binary only. The timeout is the backstop for a test that
+# deadlocks: a hang must fail the run, not stall it.
+CONCURRENCY_TIMEOUT ?= 120
+CONCURRENCY_WRAP = -DGC_TEST_WRAP_INFLATE -Wl,--wrap=inflate
+
+.build/concurrency: $(NATIVE) native/compress.h tests/concurrency.c
+	mkdir -p .build
+	$(CC) $(CFLAGS) -O2 -Inative tests/concurrency.c $(NATIVE) -lz -lpthread \
+		$(CONCURRENCY_WRAP) -o $@
+
+concurrency: .build/concurrency
+	timeout $(CONCURRENCY_TIMEOUT) ./.build/concurrency --selftest
+
+# ThreadSanitizer is the only tool that sees the registry refcount and the
+# per-decoder lock. It is a separate target because it needs its own runtime.
+concurrency-tsan: $(NATIVE) native/compress.h tests/concurrency.c
+	mkdir -p .build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=thread -Inative tests/concurrency.c \
+		$(NATIVE) -lz -lpthread $(CONCURRENCY_WRAP) -o .build/concurrency-tsan
+	TSAN_OPTIONS=halt_on_error=1 timeout $(CONCURRENCY_TIMEOUT) \
+		./.build/concurrency-tsan --selftest
+
+test: fixtures corpus native concurrency
 	"$(GOOSE)" run tests/spec.goose
 	"$(GOOSE)" run tests/boundaries.goose
 	"$(GOOSE)" run tests/api.goose
@@ -73,6 +97,10 @@ sanitize: fixtures
 	mkdir -p .build
 	$(SANITIZER) $(SANITIZE_FLAGS) -o .build/driver-sanitize tests/driver.c $(NATIVE) $(SANITIZE_LIBS)
 	$(SANITIZE_ENV) ./.build/driver-sanitize --selftest
+	$(SANITIZER) $(SANITIZE_FLAGS) -o .build/concurrency-sanitize \
+		tests/concurrency.c $(NATIVE) $(SANITIZE_LIBS) $(CONCURRENCY_WRAP)
+	$(SANITIZE_ENV) timeout $(CONCURRENCY_TIMEOUT) \
+		./.build/concurrency-sanitize --selftest
 	@for target in spec boundaries api contract differential; do \
 		echo "sanitize: $$target"; \
 		"$(GOOSE)" tests/$$target.goose --standalone --debug --no-bce \

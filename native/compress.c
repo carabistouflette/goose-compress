@@ -32,6 +32,15 @@ struct decoder {
     int has_dictionary;
     uint8_t *dictionary;
     size_t dictionary_len;
+    /* Serialises use of this one decoder. The contract says concurrent use of
+     * one handle is the caller's error, so this is not a promise that it works;
+     * it is what keeps a close from freeing a decoder another thread is inside
+     * of, and it turns that misuse into serialised calls instead of a race. */
+    pthread_mutex_t lock;
+    /* Lookups in flight, and whether a close has claimed the slot. Both are
+     * guarded by decoders_lock. */
+    int refs;
+    int closing;
 };
 
 typedef struct {
@@ -39,9 +48,12 @@ typedef struct {
     struct decoder *decoder;
 } decoder_slot;
 
-/* The lock protects the registry only. A live decoder belongs to the caller
- * that opened it; concurrent use of one handle is the caller's error. */
+/* The registry lock protects the table and the per-decoder refcount, and is
+ * held only for a lookup or a release. It is deliberately NOT held across
+ * inflate: holding it there serialised every decoder in the process, so eight
+ * threads decoding eight independent streams ran at the speed of one. */
 static pthread_mutex_t decoders_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t decoders_idle = PTHREAD_COND_INITIALIZER;
 static decoder_slot decoders[GC_MAX_DECODERS];
 
 static int64_t encode_handle(size_t index, uint64_t generation) {
@@ -60,6 +72,30 @@ static struct decoder *find_decoder(int64_t handle) {
     decoder_slot *slot = &decoders[index - 1];
     if (!slot->decoder || slot->generation != generation) return NULL;
     return slot->decoder;
+}
+
+/* Takes a reference on a live decoder, or returns NULL. The reference is what
+ * makes it safe to use the decoder after the registry lock is dropped: a close
+ * cannot free it until every reference is released. */
+static struct decoder *acquire_decoder(int64_t handle) {
+    pthread_mutex_lock(&decoders_lock);
+    struct decoder *decoder = find_decoder(handle);
+    if (decoder && !decoder->closing) {
+        decoder->refs += 1;
+    } else {
+        decoder = NULL;
+    }
+    pthread_mutex_unlock(&decoders_lock);
+    return decoder;
+}
+
+static void release_decoder(struct decoder *decoder) {
+    pthread_mutex_lock(&decoders_lock);
+    decoder->refs -= 1;
+    if (decoder->refs == 0 && decoder->closing) {
+        pthread_cond_broadcast(&decoders_idle);
+    }
+    pthread_mutex_unlock(&decoders_lock);
 }
 
 static int window_bits(int64_t format) {
@@ -103,6 +139,12 @@ int64_t gc_open(int64_t format, gc_meta meta) {
         return 0;
     }
     decoder->format = (int)format;
+    if (pthread_mutex_init(&decoder->lock, NULL) != 0) {
+        inflateEnd(&decoder->stream);
+        free(decoder);
+        meta.data[0] = GC_SYSTEM;
+        return 0;
+    }
     int64_t handle = 0;
     pthread_mutex_lock(&decoders_lock);
     for (size_t i = 0; i < GC_MAX_DECODERS; ++i) {
@@ -119,6 +161,7 @@ int64_t gc_open(int64_t format, gc_meta meta) {
          * cannot get a slot has hit a system limit, which is what
          * Error.SystemError documents. Reporting GC_LIMIT here would tell the
          * caller its stream was too large, which is not what happened. */
+        pthread_mutex_destroy(&decoder->lock);
         inflateEnd(&decoder->stream);
         free(decoder);
         meta.data[0] = GC_SYSTEM;
@@ -137,21 +180,20 @@ int64_t gc_dictionary(int64_t handle, gc_input dictionary, gc_meta meta) {
         meta.data[0] = GC_LIMIT;
         return GC_LIMIT;
     }
-    pthread_mutex_lock(&decoders_lock);
-    struct decoder *decoder = find_decoder(handle);
-    if (!decoder) {
-        pthread_mutex_unlock(&decoders_lock);
-        return GC_INVALID;
-    }
+    struct decoder *decoder = acquire_decoder(handle);
+    if (!decoder) return GC_INVALID;
+    pthread_mutex_lock(&decoder->lock);
     if (decoder->format == GC_GZIP || decoder->has_dictionary) {
-        pthread_mutex_unlock(&decoders_lock);
+        pthread_mutex_unlock(&decoder->lock);
+        release_decoder(decoder);
         return GC_INVALID;
     }
     uint8_t *copy = NULL;
     if (dictionary.len > 0) {
         copy = malloc((size_t)dictionary.len);
         if (!copy) {
-            pthread_mutex_unlock(&decoders_lock);
+            pthread_mutex_unlock(&decoder->lock);
+            release_decoder(decoder);
             meta.data[0] = GC_SYSTEM;
             return GC_SYSTEM;
         }
@@ -167,7 +209,8 @@ int64_t gc_dictionary(int64_t handle, gc_input dictionary, gc_meta meta) {
         code = inflateSetDictionary(&decoder->stream, decoder->dictionary,
                                     (uInt)decoder->dictionary_len);
     }
-    pthread_mutex_unlock(&decoders_lock);
+    pthread_mutex_unlock(&decoder->lock);
+    release_decoder(decoder);
     if (code != Z_OK) {
         meta.data[0] = status_of(code);
         return status_of(code);
@@ -183,12 +226,9 @@ int64_t gc_inflate(int64_t handle, gc_input input, gc_output output, gc_meta met
     if (input.len > 0 && !input.data) return GC_INVALID;
     if (output.len > 0 && !output.data) return GC_INVALID;
     if (output.len == 0) return GC_INVALID;
-    pthread_mutex_lock(&decoders_lock);
-    struct decoder *decoder = find_decoder(handle);
-    if (!decoder) {
-        pthread_mutex_unlock(&decoders_lock);
-        return GC_INVALID;
-    }
+    struct decoder *decoder = acquire_decoder(handle);
+    if (!decoder) return GC_INVALID;
+    pthread_mutex_lock(&decoder->lock);
     z_stream *stream = &decoder->stream;
     stream->next_in = (Bytef *)input.data;
     stream->avail_in = (uInt)(input.len > (int64_t)UINT_MAX ? UINT_MAX : input.len);
@@ -205,7 +245,8 @@ int64_t gc_inflate(int64_t handle, gc_input input, gc_output output, gc_meta met
             meta.data[3] = 2;
             meta.data[4] = (int64_t)stream->adler;
             meta.data[5] = GC_DICT_REQUIRED;
-            pthread_mutex_unlock(&decoders_lock);
+            pthread_mutex_unlock(&decoder->lock);
+            release_decoder(decoder);
             return GC_DICT_REQUIRED;
         }
         uLong expected = adler32(0L, Z_NULL, 0);
@@ -217,14 +258,16 @@ int64_t gc_inflate(int64_t handle, gc_input input, gc_output output, gc_meta met
             meta.data[3] = 2;
             meta.data[4] = (int64_t)stream->adler;
             meta.data[5] = GC_DICT_MISMATCH;
-            pthread_mutex_unlock(&decoders_lock);
+            pthread_mutex_unlock(&decoder->lock);
+            release_decoder(decoder);
             return GC_DICT_MISMATCH;
         }
         int set = inflateSetDictionary(stream, decoder->dictionary,
                                        (uInt)decoder->dictionary_len);
         if (set != Z_OK) {
             meta.data[5] = status_of(set);
-            pthread_mutex_unlock(&decoders_lock);
+            pthread_mutex_unlock(&decoder->lock);
+            release_decoder(decoder);
             return status_of(set);
         }
         code = inflate(stream, Z_NO_FLUSH);
@@ -241,19 +284,17 @@ int64_t gc_inflate(int64_t handle, gc_input input, gc_output output, gc_meta met
         status = status_of(code);
     }
     meta.data[5] = status;
-    pthread_mutex_unlock(&decoders_lock);
+    pthread_mutex_unlock(&decoder->lock);
+    release_decoder(decoder);
     return status;
 }
 
 int64_t gc_reset(int64_t handle, gc_meta meta) {
     if (meta.len < 1 || !meta.data) return GC_INVALID;
     meta.data[0] = GC_INVALID;
-    pthread_mutex_lock(&decoders_lock);
-    struct decoder *decoder = find_decoder(handle);
-    if (!decoder) {
-        pthread_mutex_unlock(&decoders_lock);
-        return GC_INVALID;
-    }
+    struct decoder *decoder = acquire_decoder(handle);
+    if (!decoder) return GC_INVALID;
+    pthread_mutex_lock(&decoder->lock);
     int code = inflateReset(&decoder->stream);
     /* inflateReset drops the window, and a raw stream carries no DICTID to
      * ask for the dictionary again, so it is re-applied here. A zlib stream
@@ -262,7 +303,8 @@ int64_t gc_reset(int64_t handle, gc_meta meta) {
         code = inflateSetDictionary(&decoder->stream, decoder->dictionary,
                                     (uInt)decoder->dictionary_len);
     }
-    pthread_mutex_unlock(&decoders_lock);
+    pthread_mutex_unlock(&decoder->lock);
+    release_decoder(decoder);
     if (code != Z_OK) {
         meta.data[0] = status_of(code);
         return status_of(code);
@@ -283,11 +325,17 @@ int64_t gc_close(int64_t handle, gc_meta meta) {
     uint64_t token = (uint64_t)handle;
     uint64_t index = (token & UINT64_C(0x7fff));
     decoder_slot *slot = &decoders[index - 1];
+    /* Retire the handle first so no new caller can acquire it, then wait for
+     * the in-flight ones. A concurrent gc_inflate on the same handle is a
+     * contract violation, but it must not touch freed memory. */
+    decoder->closing = 1;
     slot->decoder = NULL;
     slot->generation += 1;
+    while (decoder->refs > 0) pthread_cond_wait(&decoders_idle, &decoders_lock);
     pthread_mutex_unlock(&decoders_lock);
     inflateEnd(&decoder->stream);
     free(decoder->dictionary);
+    pthread_mutex_destroy(&decoder->lock);
     free(decoder);
     meta.data[0] = GC_OK;
     return GC_OK;
