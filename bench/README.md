@@ -83,7 +83,24 @@ python3 bench/runner.py --goose /path/to/pinned/goose --samples 20 \
 The runner keeps every raw sample, alternates the harness order each round so
 slow drift lands on all rows, pins the child processes to one allowed CPU,
 discards two warm-up rounds, and reports min/max/median/mean/stdev/MAD/p90/p99/
-IQR plus peak RSS. It records the Goose and C compiler paths, versions and
+IQR plus peak RSS.
+
+Two things about the output are worth knowing before reading it.
+
+`--budget-mode exact|headroom` decides `limits.output_bytes`: `exact` sets it to
+the payload, which is the tightest case, and `headroom` sets it to
+`--headroom-bytes` (16 MiB by default), which is what a caller that does not
+know the size does. They are different workloads and a change can help one and
+hurt the other, so they are separate runs and the mode is recorded in
+`method.budget_mode`.
+
+`rows[].per_call_ns.samples` is sorted, which is right for a distribution and
+wrong for pairing. Every observation is therefore also written to
+`<output>.observations.jsonl` in acquisition order with fixture, round, position
+in the round, implementation, iteration count and the unrounded `total_ns`, and
+the `paired` section divides two rows round by round and reports the median
+ratio with a bootstrap 95% interval. A ratio whose interval contains 1.0 is no
+difference, not a small win. It records the Goose and C compiler paths, versions and
 binary hashes; measured source and benchmark binary hashes; resolved shared
 library paths and hashes; compiler flags; git state; CPU model/governor and
 load average before and after. Load average is recorded but excluded from the
