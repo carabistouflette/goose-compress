@@ -26,6 +26,23 @@ static int64_t now_ns(void) {
     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
+/* Peak resident set size in KiB, so a row that traded memory for time shows
+ * it. -1 when /proc is unavailable. */
+static long peak_rss_kb(void) {
+    FILE *file = fopen("/proc/self/status", "r");
+    if (!file) return -1;
+    char line[256];
+    long value = -1;
+    while (fgets(line, sizeof line, file)) {
+        if (strncmp(line, "VmHWM:", 6) == 0) {
+            value = strtol(line + 6, NULL, 10);
+            break;
+        }
+    }
+    fclose(file);
+    return value;
+}
+
 static uint8_t *read_file(const char *path, size_t *length) {
     FILE *file = fopen(path, "rb");
     if (!file) return NULL;
@@ -101,9 +118,10 @@ int main(int argc, char **argv) {
     }
     int64_t elapsed = now_ns() - start;
     printf("mode=oneshot input=%zu output=%zu iterations=%ld total_ns=%lld "
-           "per_call_ns=%lld fnv1a=%llu\n",
+           "per_call_ns=%lld fnv1a=%llu peak_rss_kb=%ld\n",
            input_len, produced, iterations, (long long)elapsed,
-           (long long)(elapsed / iterations), (unsigned long long)digest);
+           (long long)(elapsed / iterations), (unsigned long long)digest,
+           peak_rss_kb());
     libdeflate_free_decompressor(decompressor);
     free(output);
     free(input);

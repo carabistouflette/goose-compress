@@ -21,7 +21,7 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
            examples/artifact_payload.goose
 
 .PHONY: setup format check fixtures corpus native test sanitize sanitize-negative \
-        bench bench-build bench-run baseline baseline-verify clean
+        bench bench-build bench-plan bench-run baseline baseline-verify clean
 
 setup:
 	./scripts/setup-goose.sh
@@ -92,9 +92,14 @@ bench: bench-build
 bench-build: fixtures
 	mkdir -p .build
 	"$(GOOSE)" build bench/bench.goose --cc $(BENCH_CC) -O2 -o .build/bench
+	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_bounded.c -lz -o .build/zlib-bounded
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_oneshot.c -lz -o .build/zlib-oneshot
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/libdeflate_oneshot.c -ldeflate \
 		-o .build/libdeflate-oneshot
+
+# Prints the exact commands, the input set and the call count. Times nothing.
+bench-plan: bench-build
+	python3 bench/runner.py --plan
 
 bench-run: bench-build
 	python3 bench/runner.py --goose "$(GOOSE)" --cc $(BENCH_CC) \
