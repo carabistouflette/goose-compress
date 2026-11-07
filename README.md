@@ -65,7 +65,7 @@ compiler, supply `GOOSE=/absolute/path/to/goose` to Make and use that path for
 Declare the dependency in the application's root source:
 
 ```goose
-import compress from "carabistouflette/goose-compress@<commit>";
+import compress from "carabistouflette/goose-compress@3ed7ec373bc9f9ec04c16cd05b83640fac283da9";
 ```
 
 Or use `import compress from "../goose-compress";` for a sibling checkout.
