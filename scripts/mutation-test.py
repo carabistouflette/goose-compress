@@ -8,11 +8,12 @@ them is a syntax error, a compile failure or an unconditional abort: every one
 compiles and runs, and only a test that actually checks the guarantee can tell
 it apart from the pristine tree.
 
-The pristine tree is not green -- `tests/contract.goose` fails the 33rd-`open`
-check until the adapter returns `Error.SystemError`. So the pristine run is
-recorded as a *failure signature* and a mutant counts as killed only when it
-adds a failure the pristine run does not have. That keeps the harness honest
-while the known defect is open.
+The pristine tree must be green: every functional program exits zero before a
+single mutant is applied. A mutant counts as killed only when it makes a
+program fail or adds a diagnostic line the pristine run does not have. If the
+pristine run is not green the harness stops instead of scoring mutants against
+a red suite, because a mutant "killed" by an already-failing check proves
+nothing about the guarantee it breaks.
 
 Every mutant is applied to its own copy of the tree under `.build/mutation/`;
 the working tree is never touched. Per mutant the report keeps the diff, the
@@ -211,6 +212,15 @@ def main():
     print("  exit codes: " + ", ".join(
         "%s=%d" % (p, r["exit"]) for p, r in pristine.items()))
     print("  %d diagnostic line(s) already present" % len(pristine_lines))
+    if pristine_nonzero or pristine_lines:
+        # Scoring mutants against a red suite would count a mutant as killed
+        # by a check that was already failing, which proves nothing about the
+        # guarantee the mutant breaks. Refuse instead.
+        for program, run in sorted(pristine.items()):
+            for line in run["lines"]:
+                print("  pristine %s: %s" % (program, line))
+        raise SystemExit("the pristine tree is not green; fix it before "
+                         "scoring mutants")
 
     report = {
         "goose": str(goose),
@@ -219,6 +229,7 @@ def main():
                     for name in ("compress.goose", "native/compress.c")},
         "programs": PROGRAMS,
         "pristine": {
+            "green": not pristine_nonzero and not pristine_lines,
             "exit": {p: r["exit"] for p, r in pristine.items()},
             "lines": sorted("%s: %s" % pair for pair in pristine_lines),
         },

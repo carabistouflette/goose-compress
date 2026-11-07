@@ -9,8 +9,7 @@
 //
 // Every assertion here is in the direction the documentation promises. There
 // is no "known gap" registry: a contract point the runtime does not meet is a
-// failing check with a nonzero exit, not a printed note. The one such point
-// today is the 33rd `open`, which must return `Error.SystemError`.
+// failing check with a nonzero exit, not a printed note.
 import compress from "..";
 import os;
 import std;
@@ -540,10 +539,9 @@ fn main() {
 
     // ---- Table exhaustion -------------------------------------------------
     // README, docs/api.md and docs/design.md all promise Error.SystemError for
-    // a 33rd concurrent decoder. The adapter reports GC_LIMIT, which the Goose
-    // layer maps to Error.LimitExceeded, so this fails until gc_open's
-    // table-full branch sets meta.data[0] = GC_SYSTEM. Reproduced in
-    // .build/probe/limit.goose.
+    // a 33rd concurrent decoder, because the table is a fixed system resource
+    // rather than a stream budget. The adapter reports GC_SYSTEM there, which
+    // the Goose layer maps to Error.SystemError.
     let limits = compress::Limits { .. };
     var held: compress::Decoder[>..] = [];
     var refusal = compress::Error.None;

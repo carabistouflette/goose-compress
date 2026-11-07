@@ -31,15 +31,11 @@ generation counter is capped at `0x7FFFFFFFFFFF`; a slot that reaches the cap
 is retired rather than wrapped, so a handle can never be reused.
 
 The table is a fixed array, so `open` has no allocation of its own beyond the
-`z_stream` and its window. A 33rd concurrent decoder returns `Error.SystemError`.
-
-**Known defect, blocking.** The adapter's table-full branch currently sets
-`meta.data[0] = GC_LIMIT`, and `to_error(2)` is `Error.LimitExceeded`, so the
-33rd `open` returns `LimitExceeded` instead of the promised `SystemError`.
-Reproduced in `.build/probe/limit.goose` and asserted by `tests/contract.goose`,
-which fails until `gc_open` sets `GC_SYSTEM` there. The fix is one line in
-`native/compress.c` and is held back until the frozen baseline reference window
-closes.
+`z_stream` and its window. A 33rd concurrent decoder returns `Error.SystemError`:
+the table is a fixed system resource, not a stream budget, so reporting
+`LimitExceeded` there would tell the caller its stream was too large when the
+real cause is that 32 decoders are already open. `tests/contract.goose` asserts
+this, and `tests/driver.c` asserts the adapter's own status code.
 
 ## Output budget and the one-byte sentinel
 

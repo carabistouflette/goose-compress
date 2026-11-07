@@ -115,9 +115,13 @@ int64_t gc_open(int64_t format, gc_meta meta) {
     }
     pthread_mutex_unlock(&decoders_lock);
     if (!handle) {
+        /* The table is a fixed resource, not a stream budget: a caller that
+         * cannot get a slot has hit a system limit, which is what
+         * Error.SystemError documents. Reporting GC_LIMIT here would tell the
+         * caller its stream was too large, which is not what happened. */
         inflateEnd(&decoder->stream);
         free(decoder);
-        meta.data[0] = GC_LIMIT;
+        meta.data[0] = GC_SYSTEM;
         return 0;
     }
     meta.data[0] = GC_OK;

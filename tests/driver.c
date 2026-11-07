@@ -298,8 +298,8 @@ static void test_slots(void) {
     check(opened > 0 && opened <= 32, "slots: the registry is bounded");
     int64_t meta[2] = {0, 0};
     gc_meta view = {meta, 2};
-    check(gc_open(GC_RAW, view) == 0 && meta[0] == GC_LIMIT,
-          "slots: exhaustion is a limit, not a crash");
+    check(gc_open(GC_RAW, view) == 0 && meta[0] == GC_SYSTEM,
+          "slots: exhaustion is a system error, not a stream limit");
     int64_t close_meta[1] = {0};
     gc_meta close_view = {close_meta, 1};
     for (int i = 0; i < 64; ++i) {
