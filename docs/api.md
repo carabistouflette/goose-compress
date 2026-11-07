@@ -116,10 +116,10 @@ Consumes all of `input` and appends decoded bytes to `out`.
   `Malformed` failure reports the prefix it managed to decode. The caller
   decides whether to keep them.
 - `out` grows by at most 65,536 bytes per internal step, and never beyond
-  `limits.output_bytes` in total. The step is sized to the stream rather than
-  fixed: it is `min(chunk_bytes, max(4096, produced))`, so a small stream is not
-  charged a 64 KiB zero-fill per call and a large one still gets the full
-  64 KiB. The bound above is the maximum, not the constant.
+  `limits.output_bytes` in total. The first step of a decode is 4,096 bytes and
+  every step after it is the full 65,536, so a small stream is not charged a
+  64 KiB zero-fill per call and a large one reaches the full chunk after one
+  step. The bound above is the maximum, not the constant.
 
 ### `finish(decoder) -> Error`
 
@@ -217,7 +217,7 @@ Two consequences are worth stating because they are easy to get wrong:
 | --- | --- |
 | Native state per decoder | one `z_stream`, about 40 KiB, fixed |
 | Open decoders | 32, then `Error.SystemError` |
-| Output per `feed` step | 65,536 bytes maximum; `min(chunk_bytes, max(4096, produced))` |
+| Output per `feed` step | 65,536 bytes maximum; 4,096 on the first step of a decode |
 | Output per decoder | `limits.output_bytes`, at most 1 GiB |
 | Input per decoder | `limits.input_bytes`, at most 1 GiB |
 | Dictionary | 32,768 bytes |

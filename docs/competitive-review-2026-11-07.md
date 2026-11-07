@@ -268,6 +268,51 @@ API: `inflate`/`inflateInit2`/`inflateReset`/`inflateSetDictionary`, with
   reference row is the proof that getting them right costs measurable time, and
   that cost is part of the comparison rather than hidden in a footnote.
 
+### zlib-ng as a backend for this package, not just as a comparator
+
+The comparison above answers "how fast is zlib-ng". The question that decides
+anything is "what would it cost us to use it", and that is a different
+measurement. Three routes were tried, and only the third is honest:
+
+1. `goose build -DGC_ZLIB_NG` — **does not work**. `-D` reaches the generated
+   program, not the package's native C, so the package object is still compiled
+   against `<zlib.h>` and `ldd` shows `libz.so.1`. Confirmed with `--dry-run`.
+2. A `LIBRARY_PATH` symlink to a `libz.so` that is really zlib-ng — **does not
+   work** either, for the same reason: the include is resolved at compile time.
+3. `native/zlib_backend.h` maps the zlib spellings onto `zng_` entry points
+   under `-DGC_ZLIB_NG`, and `make native-ng` runs the same 125 driver checks
+   and the same 58 concurrency checks against it. This measures the adapter on
+   zlib-ng, and `bench/compare/goose_adapter.c` measures it without the Goose
+   layer.
+
+There is a fourth route that needs no code change at all, and it is the one
+that answers the real question: zlib-ng built with `-DZLIB_COMPAT` installs a
+`libz.so.1` with zlib's ABI. Pointing `LD_LIBRARY_PATH` at it runs the
+**unchanged** Goose binary on the faster backend. `make bench-zlib-ng-compat`
+builds it under `.build/competitors`; nothing on the system is replaced.
+
+| Input | this package on zlib | this package on zlib-ng | ratio |
+| --- | ---: | ---: | ---: |
+| 1 KiB, exact budget | 1,105 ns | 340 ns | 3.29x |
+| 64 KiB, exact budget | 48,102 ns | 11,099 ns | 4.34x |
+| 1 MiB, exact budget | 761,904 ns | 161,816 ns | 4.70x |
+| 8 MiB, exact budget | 6,207,912 ns | 1,412,928 ns | 4.39x |
+
+The ABI promise is worth exactly what its verification is worth, so the whole
+suite was re-run against that link: contract parity 1081 cases and 2382 checks
+with 0 disagreements, the driver's 125 checks, the concurrency suite's 58
+checks, and ASan+UBSan on both GCC and Clang with live instrumentation. The
+checksum classification was checked on the compat ABI specifically, because
+`is_checksum_message` reads zlib's message text and a compat build is a
+different shared object.
+
+**Why it is not the default.** zlib-ng is not installed everywhere, the
+maintained codec is zlib, and a backend choice is a packaging decision rather
+than a library one. What this cycle establishes is the size of the prize and
+that the adapter does not stand in its way: on zlib-ng the adapter costs 15% at
+1 KiB and 0.1% at 8 MiB, so the remaining gap is the Goose layer, not the
+native code.
+
 ## What this means for ranking
 
 - **Bounded streaming decode** (this package's contract): goose-compress,
@@ -318,10 +363,26 @@ for f in gzip-bad-crc gzip-bad-isize zlib-bad-adler; do
     ./.build/zlib-bounded     --probe $fmt .build/fixtures/$f.in 16777216 33554432 65536 reject 1
     ./.build/zlib-ng-bounded  --probe $fmt .build/fixtures/$f.in 16777216 33554432 65536 reject 1
 done
+
+# The same classification, on every backend, as a suite rather than a spot check
+for ref in zlib-bounded zlib-ng-bounded zlib14-bounded zlib-ng-compat-bounded; do
+    python3 bench/compare/contract_parity.py --goose "$GOOSE" \
+        --reference .build/$ref --output .build/contract-parity-$ref.json
+done
+
+# The zlib-ng backend under this package's own API, and through its compat ABI
+make native-ng WRAP_INFLATE=zng_inflate
+make bench-zlib-ng-compat
+LD_LIBRARY_PATH=$PWD/.build/competitors/zlib-ng-compat/lib ./.build/driver --selftest
+LD_LIBRARY_PATH=$PWD/.build/competitors/zlib-ng-compat/lib ./.build/concurrency --selftest
 ```
 
-All three rows print `error=checksum_mismatch` for all three fixtures, with the
-same `produced`, `consumed` and payload hash.
+All four reference rows print `error=checksum_mismatch` for all three fixtures,
+with the same `produced`, `consumed` and payload hash. `contract_parity.py` now
+corrupts a payload byte and each trailer field of every fixture and requires the
+two sides to agree on the error name: 110 corrupted cases per backend, on top of
+the 1081 contract cases, all green on zlib 1.3.2, zlib 1.4, zlib-ng's `zng_` API
+and zlib-ng's `ZLIB_COMPAT` ABI.
 
 The clones live under `/tmp` and `.build/competitors/` (gitignored). Nothing
 from another package is vendored into this repository.

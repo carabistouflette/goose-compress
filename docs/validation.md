@@ -127,8 +127,27 @@ generation cap, dictionary installation, reset behaviour and the ABI report.
 ```
 $ make native
 ./.build/driver --selftest
-driver ok: 115 checks
+driver ok: 125 checks
 ```
+
+The checksum classification is asserted on all three trailer kinds — the gzip
+CRC32, the gzip ISIZE and the zlib adler32 — because the adapter decides
+`Error.Checksum` from zlib's message text, and that text belongs to the linked
+zlib rather than to the format. `make native-ng` runs the same 125 checks
+against zlib-ng, so a backend that words the message differently fails here
+instead of silently reclassifying a bad checksum as malformed data.
+
+```
+$ make native-ng WRAP_INFLATE=zng_inflate
+./.build/driver-ng --selftest
+driver ok: 125 checks
+timeout 120 ./.build/concurrency-ng --selftest
+concurrency ok: 58 checks
+```
+
+`WRAP_INFLATE` exists because `--wrap=inflate` does not intercept `zng_inflate`:
+the close-race test wraps the symbol the adapter actually calls, and the test
+pastes the name from the same header the adapter uses.
 
 ## Sanitizers
 
@@ -252,6 +271,49 @@ Every run is bounded by `CONCURRENCY_TIMEOUT` (default 120 s), and the test
 exits non-zero on a `pthread_create`, `pthread_join` or barrier error instead of
 waiting on a barrier that can never be reached.
 
+### Throughput, before and after
+
+`concurrency --throughput <threads> <iterations> <input.gz> <budget>` decodes
+`8MiB-text` in N threads with one decoder each. The baseline column is the
+archived `c99b049` `native/compress.c` linked against the same test file, so the
+only difference is the library:
+
+| Threads | baseline c99b049 | current |
+| ---: | ---: | ---: |
+| 1 | 122.0 | 125.2 |
+| 2 | 156.3 | 288.6 |
+| 4 | 151.4 | 591.5 |
+| 8 | 145.9 | 927.0 |
+
+The baseline is flat because one global lock serialised every decoder. The
+current build scales to 6.35x at 8 threads; it is not 8x because four of the
+eight cores on this part are slow cores. `docs/benchmark.md` has the protocol.
+
+### The zlib-ng backend, through its compat ABI
+
+zlib-ng built with `-DZLIB_COMPAT` installs a `libz.so.1` with zlib's ABI, so
+the unchanged binary can be run on it. An ABI promise is worth what its
+verification is worth, so the whole suite is re-run against that link:
+
+```
+$ make bench-zlib-ng-compat
+$ export LD_LIBRARY_PATH=$PWD/.build/competitors/zlib-ng-compat/lib
+$ ./.build/driver --selftest
+driver ok: 125 checks
+$ ./.build/concurrency --selftest
+concurrency ok: 58 checks
+$ for t in spec boundaries api contract; do "$GOOSE" run tests/$t.goose; done
+spec ok: 48 fixtures
+boundaries ok: 336 chunked runs
+api ok
+contract ok: 118 checks
+$ make sanitize SANITIZER_CC=gcc
+$ make sanitize SANITIZER_CC=clang
+```
+
+Both sanitizer runs are green with live instrumentation (27 handlers referenced
+under GCC, 29 under Clang) and both negative controls still fire.
+
 ## Resource bounds
 
 Measured with `/usr/bin/time -v`, peak resident set size. These are resource
@@ -302,7 +364,7 @@ python3 scripts/native-manifest.py --check
 $ make test
 wrote 48 fixtures to .build/fixtures
 wrote 100000 cases, 39142465 bytes, sha256 6e729d76...
-driver ok: 115 checks
+driver ok: 125 checks
 spec ok: 48 fixtures
 boundaries ok: 336 chunked runs
 api ok
@@ -322,12 +384,9 @@ exercised.
 
 ## Not covered
 
-- **No timing.** The benchmark harness is built and its correctness checks were
-  exercised with a single iteration each, but no measurement was recorded. The
-  measurement is serialised so that no two runs compete for a CPU.
-- **No fuzzing.** There is no `make fuzz` target. The differential corpus is
-  generated, not coverage-guided; a libFuzzer or AFL harness over `feed` would
-  be the next step for the native adapter.
+- **No coverage-guided fuzzing.** There is no `make fuzz` target. The
+  differential corpus is generated, not coverage-guided; a libFuzzer or AFL
+  harness over `feed` would be the next step for the native adapter.
 - **No sanitizer coverage of the benchmark harness.** `bench/bench.goose` is
   built with `-O2` and no sanitizer. It is a measurement tool, not a library
   entry point, but it is not instrumented.
@@ -336,6 +395,21 @@ exercised.
   is the same `feed`/`finish`/`close` sequence the instrumented tests cover, but
   the example binary itself is not instrumented.
 - **No 32-bit or big-endian build.** Only x86-64 Linux was exercised.
+- **No mutation of the concurrency guarantees.** `scripts/mutation-test.py`
+  mutates the Goose-level contract (budgets, member limit, trailing policy,
+  sticky error, consumed accounting, stale handles, dictionary limit) and kills
+  8 of 8 on a pristine-green tree. The per-decoder lock and the close wait are
+  covered by the ASan negative control and by TSan, not by a mutant.
+- **No TSan run against the zlib-ng backend.** TSan was run against zlib 1.3.2
+  only. The zlib-ng builds were checked with ASan+UBSan and with the full
+  concurrency suite, but not under ThreadSanitizer.
+- **No measurement of the `stream` and `fresh` rows against a competitor.** They
+  are measured and reported, but the equal-contract competitor rows are
+  whole-input, so the incremental rows have no fair opponent.
+- **The 1 KiB headroom runs do not meet the contention gate.** Their endpoint
+  CPU pressure check failed because other work started during the run. The
+  ratio is reproducible across three independent runs and the per-round win is
+  unanimous, but the runs are labelled exploratory in `docs/benchmark.md`.
 - **No Windows or macOS.** The adapter uses `pthread_mutex_t` and links `z` and
   `pthread` on Linux only.
 - **No concurrency test.** The handle table is mutex-protected, but no test

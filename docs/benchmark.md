@@ -1,32 +1,59 @@
 # Benchmark
 
-**No measurement has been recorded.** The harness is built and its correctness
-checks were exercised with a single iteration each, but no timing was run. The
-measurement is serialised so that no two runs compete for a CPU.
+Every number here was measured on one machine, in one session, with the raw
+observations kept. The point of the section is not the ranking: it is that a
+reader can tell which claim each number supports and which it does not.
 
-## What is measured
+## The machine and the protocol
 
-Four harnesses decode the same gzip streams and must report the same output
-length and the same FNV-1a digest. A row that did less work is rejected by
-`bench/measure.py` rather than reported.
+| | |
+| --- | --- |
+| CPU | Intel Core Ultra 7 258V (Lunar Lake), 8 cores, **hybrid**, no SMT |
+| Cores | cpu0–3 fast (4.7–4.8 GHz), cpu4–7 slow (3.7 GHz), 12 MiB L3 |
+| OS | Arch Linux, kernel as recorded in each report's `provenance` |
+| Compilers | GCC 16.2.1, Clang (version in `provenance`) |
+| zlib | 1.3.2 (system) |
+| zlib 1.4 | built static under `.build/competitors/zlib-1.4` |
+| zlib-ng | 2.3.3, both the `zng_` API and a `-DZLIB_COMPAT` build |
+| libdeflate | 1.26 |
+| Goose | pinned toolchain, hash in `provenance` |
 
-| Harness | Contract | What it isolates |
-| --- | --- | --- |
-| `goose-compress oneshot` | one `decompress` call, bounded | the whole public one-call path |
-| `goose-compress stream` | 64 KiB `feed` steps, fresh decoder per call | the incremental path, including open and close |
-| `zlib oneshot` | `inflateInit2` + one `inflate(Z_FINISH)`, no bounds | what the bounded state machine costs on top of zlib |
-| `libdeflate oneshot` | `libdeflate_gzip_decompress_ex`, no bounds | a different maintained decoder at the same contract |
+- 20 samples per row, 2 warm-up rounds discarded, one round = every row once.
+- Alternating order: each round starts one row later, so a drift over the run is
+  spread across every row instead of landing on whichever ran last.
+- Every measured child inherits one selected allowed CPU, chosen as the least
+  busy fast core and gated on its measured foreign busy fraction, on the p90 of
+  wall/process-CPU time for a fixed calibration, and on CPU pressure
+  `some-avg10`. The gate is re-checked after the run.
+- The whole campaign is serialised with `flock` on a shared lock file, because
+  other work on this machine competes for the same cores.
+- Every sample must report the expected output length and FNV-1a digest, or the
+  run aborts. The digest is computed outside the timed loop.
 
-The last two are not competitors in the "which is faster" sense. They have no
-budgets, no member policy, no trailing policy and no incremental state, so they
-cannot be compared to this library on equal terms for anything except the
-narrow case of "one gzip stream in, the whole payload out". That narrow case is
-what the rows measure, and it is the only claim the numbers will support.
+### Two budget scenarios, reported separately
 
-`goose-compress invalid` measures the error path on a truncated stream and on a
-corrupted CRC. There is no comparable row: zlib and libdeflate one-shot have no
-bounded error path to measure, and their failure mode is a return code with no
-partial output.
+`limits.output_bytes` changes the workload, so it is a parameter of the
+measurement and not a detail:
+
+- **exact** — the budget equals the payload. The decoder must stop on the last
+  byte, and a stream that produces one more byte is over budget.
+- **headroom** — one fixed 16 MiB budget, far above every payload. This is what
+  a caller that does not know the size does, and it is the default in
+  `docs/api.md`.
+
+They are not interchangeable. The step-size change below is worth 2.0x in one
+and costs 2.9% in the other, and reporting a single number would hide that.
+
+### Paired ratios, not two medians
+
+`dispersion()` sorts its samples, which is right for a distribution and wrong
+for pairing. Every observation is therefore also written to
+`<output>.observations.jsonl` in acquisition order, with fixture, round,
+position in the round, implementation, iteration count and the unrounded
+`total_ns`. The `paired` section of each report divides two rows round by round
+and reports the median ratio with a bootstrap 95% interval over 10,000
+resamples, plus how many rounds each side won. A ratio whose interval contains
+1.0 is reported as no difference, not as a small win.
 
 ## Inputs
 
@@ -52,31 +79,192 @@ handles one shape is not measured by the other.
 Two invalid inputs are derived from `64KiB-text.gz`: a truncated stream (88 of
 177 bytes) and a corrupted CRC (byte −8 flipped).
 
-Every input's SHA-256 and FNV-1a are recorded in `.build/bench-inputs/inputs.json`.
+## Rows
 
-## Method
+| Row | Contract | Comparable |
+| --- | --- | --- |
+| `goose-compress oneshot` | bounded: output budget, input budget, 1 member, trailing rejected | yes |
+| `goose-compress stream` | same limits, 64 KiB input steps | yes |
+| `goose-compress fresh` | same limits, buffer allocated inside every call | yes |
+| `goose-compress tail` | finish + close after the last byte | yes |
+| `goose-compress baseline c99b049` | the published binary, unchanged | yes |
+| `zlib bounded whole` | the same framing policy on zlib, whole input in one call | yes |
+| `zlib bounded stream` | the same framing policy on zlib, 64 KiB input steps | yes |
+| `zlib 1.4 bounded whole` | the same policy on zlib 1.4, built static here | yes |
+| `zlib-ng bounded whole` | the same policy on zlib-ng's `zng_` API | yes |
+| `goose-compress oneshot (zlib-ng compat backend)` | the same binary and policy code on zlib-ng through `ZLIB_COMPAT` | yes |
+| `goose-compress adapter + zlib` | `gc_open`/`gc_inflate`/`gc_close` without the Goose layer | yes |
+| `goose-compress adapter + zlib-ng` | the same adapter on zlib-ng | yes |
+| `libdeflate oneshot` | bounded one-shot: `out_nbytes_avail` is the budget, trailing rejected via `actual_in_nbytes`; no cumulative budget, no member policy, no dictionary, no checksum/malformed split | yes, one-shot only |
+| `zlib oneshot` | unbounded: no budget, no trailing check | **no** |
+| `goose-deflate whole buffer` | unbounded: whole member, no budget, bool result | **no** |
 
-- `CLOCK_MONOTONIC` around the call loop, with one warm-up call outside it.
-- Iterations per size: 2,000 for 1 KiB, 500 for 64 KiB, 100 for 1 MiB, 20 for
-  8 MiB.
-- Seven repetitions per row; the reported figure is the median of the seven
-  per-call nanosecond values, and all seven samples are kept in the JSON.
-- Every run is verified: the output length and the FNV-1a digest must match the
-  recorded expectation, or the run aborts.
-- The `stream` row opens and closes a decoder inside the timed loop, so
-  allocation and cleanup are inside the measurement. The `oneshot` rows reuse
-  one decompressor where the API allows it, which is what a caller would do.
+The two `no` rows are overhead references. They are never used to rank the
+library, because a row that does less work is not a faster row.
+
+## Results
+
+Median per-call nanoseconds, `1KiB-text` … `8MiB-text`, 20 samples each. The
+`exact` and `headroom` columns are separate runs.
+
+### 1 KiB
+
+| Row | exact | headroom |
+| --- | ---: | ---: |
+| goose-compress oneshot | 1,105 | 1,089 |
+| goose-compress baseline c99b049 | 1,078 | 2,206 |
+| zlib bounded whole | 1,056 | 991 |
+| zlib 1.4 bounded whole | 1,040 | 1,005 |
+| zlib-ng bounded whole | 276 | 272 |
+| goose-compress oneshot (zlib-ng compat) | 340 | 352 |
+| adapter + zlib | 1,085 | 1,036 |
+| adapter + zlib-ng | 326 | 322 |
+| libdeflate oneshot | 3,269 | 3,265 |
+| goose-deflate whole buffer | 4,922 | 4,916 |
+
+### 64 KiB
+
+| Row | exact | headroom |
+| --- | ---: | ---: |
+| goose-compress oneshot | 48,102 | 48,021 |
+| goose-compress baseline c99b049 | 47,943 | 47,899 |
+| zlib bounded whole | 47,621 | 47,332 |
+| zlib 1.4 bounded whole | 47,422 | 47,299 |
+| zlib-ng bounded whole | 10,088 | 10,124 |
+| goose-compress oneshot (zlib-ng compat) | 11,099 | 11,107 |
+| adapter + zlib | 47,297 | 47,261 |
+| adapter + zlib-ng | 10,335 | 10,415 |
+| libdeflate oneshot | 97,469 | 96,737 |
+| goose-deflate whole buffer | 197,622 | 197,644 |
+
+### 1 MiB
+
+| Row | exact | headroom |
+| --- | ---: | ---: |
+| goose-compress oneshot | 761,904 | 763,513 |
+| goose-compress baseline c99b049 | 762,037 | 762,909 |
+| zlib bounded whole | 738,057 | 738,865 |
+| zlib 1.4 bounded whole | 739,714 | 741,993 |
+| zlib-ng bounded whole | 140,814 | 140,700 |
+| goose-compress oneshot (zlib-ng compat) | 161,816 | 162,409 |
+| adapter + zlib | 741,236 | 742,375 |
+| adapter + zlib-ng | 141,724 | 141,804 |
+| libdeflate oneshot | 1,036,388 | 1,038,050 |
+| goose-deflate whole buffer | 3,116,223 | 3,119,405 |
+
+### 8 MiB
+
+| Row | exact | headroom |
+| --- | ---: | ---: |
+| goose-compress oneshot | 6,207,912 | 6,217,393 |
+| goose-compress baseline c99b049 | 6,203,311 | 6,211,847 |
+| zlib bounded whole | 5,891,507 | 5,909,717 |
+| zlib 1.4 bounded whole | 5,915,473 | 5,932,254 |
+| zlib-ng bounded whole | 1,149,754 | 1,143,119 |
+| goose-compress oneshot (zlib-ng compat) | 1,412,928 | 1,413,869 |
+| adapter + zlib | 5,780,961 | 5,792,002 |
+| adapter + zlib-ng | 1,150,694 | 1,147,721 |
+| libdeflate oneshot | 7,908,041 | 7,906,778 |
+| goose-deflate whole buffer | 24,999,517 | 25,019,117 |
+
+## Paired ratios
+
+Median of the per-round ratio, with a bootstrap 95% interval over 20 rounds.
+`n/20` is how many rounds the numerator won.
+
+### Against the published baseline
+
+| Input | exact | headroom |
+| --- | --- | --- |
+| 1 KiB | 1.029 [1.013, 1.055] 3/20 | **0.494 [0.489, 0.499] 20/20** |
+| 64 KiB | 1.004 [0.998, 1.006] 7/20 | 1.003 [0.998, 1.005] 8/20 |
+| 1 MiB | 0.998 [0.997, 0.999] 15/20 | 1.001 [0.999, 1.002] 8/20 |
+| 8 MiB | 1.000 [0.998, 1.002] 10/20 | 1.002 [0.999, 1.004] 8/20 |
+
+Read this honestly. The step-size change is **2.0x faster at 1 KiB with
+headroom** and **2.9% slower at 1 KiB with an exact budget**. Everywhere else it
+is within noise. The 2.9% is the cost of the per-decoder lock, which is what
+buys the concurrency result below; at 1 KiB the whole call is about 1 µs, so an
+uncontended mutex pair is 3% of it.
+
+### Against the same zlib under the same framing policy
+
+| Input | exact | headroom |
+| --- | --- | --- |
+| 1 KiB | 1.052 [1.038, 1.083] | 1.087 [1.065, 1.101] |
+| 64 KiB | 1.010 [1.007, 1.015] | 1.014 [1.012, 1.016] |
+| 1 MiB | 1.031 [1.030, 1.034] | 1.034 [1.031, 1.035] |
+| 8 MiB | 1.053 [1.051, 1.055] | 1.053 [1.052, 1.058] |
+
+This is the price of the bounded state machine, the handle table, the budgets
+and the error taxonomy on top of zlib. It is 1–9% depending on size, and it is
+the number to attack next: at 8 MiB the adapter alone is 2% *faster* than the C
+reference, so the 5.3% is the Goose layer.
+
+### Against zlib-ng through its `ZLIB_COMPAT` ABI
+
+Same binary, same policy code, only `libz.so.1` differs.
+
+| Input | exact | headroom |
+| --- | --- | --- |
+| 1 KiB | **3.293 [3.177, 3.401]** | **3.122 [3.103, 3.144]** |
+| 64 KiB | **4.335 [4.307, 4.367]** | **4.317 [4.301, 4.358]** |
+| 1 MiB | **4.703 [4.689, 4.715]** | **4.703 [4.690, 4.718]** |
+| 8 MiB | **4.392 [4.370, 4.408]** | **4.412 [4.389, 4.425]** |
+
+This is the largest available win and it needs no change to the adapter. It is
+not the default, because zlib-ng is not installed everywhere and because the
+maintained codec is zlib; `make bench-zlib-ng-compat` builds it under
+`.build/competitors` and nothing on the system is replaced.
+
+### Independent confirmation
+
+A second campaign with 24 samples and 3 warm-up rounds, on a different day and a
+different core, reproduced the two headline ratios:
+
+| Claim | Campaign | Confirmation |
+| --- | --- | --- |
+| 64 KiB exact, vs baseline | 1.004 [0.998, 1.006] | 1.001 [1.000, 1.004] |
+| 64 KiB exact, vs zlib-ng compat | 4.335 [4.307, 4.367] | 4.375 [4.343, 4.386] |
+| 1 KiB headroom, vs baseline | 0.494 [0.489, 0.499] | 0.490 [0.485, 0.493] |
+| 1 KiB headroom, vs zlib-ng compat | 3.122 [3.103, 3.144] | 3.031 [2.983, 3.146] |
+
+The 1 KiB headroom runs are labelled **exploratory**: their endpoint CPU
+pressure check failed (PSI `some-avg10` 5.6 against a 5.0 limit) because other
+work on the machine started during the run. The ratio is stable across three
+independent runs (0.494, 0.4945, 0.490) and the per-round win is 20/20 and 24/24,
+but the run does not meet the gate and is not presented as if it did.
+
+## Concurrency
+
+`concurrency --throughput <threads> <iterations> <input.gz> <budget>` decodes
+`8MiB-text` in N threads, each with its own decoder, and reports decodes per
+second. The baseline column is the archived `c99b049` `native/compress.c` linked
+against the same test file, so the only difference is the library.
+
+| Threads | baseline c99b049 | current | speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 122.0 | 125.2 | 1.03x |
+| 2 | 156.3 | 288.6 | 1.85x |
+| 4 | 151.4 | 591.5 | 3.91x |
+| 8 | 145.9 | 927.0 | **6.35x** |
+
+The baseline is flat: a single global lock serialised every decoder, so adding
+threads added contention and nothing else. 8 threads on 8 cores gives 6.35x and
+not 8x because four of those cores are slow cores at 3.7 GHz. This is a
+measurement on this part, not a promise about a different one.
 
 ## Running it
 
 ```sh
-make bench          # builds only; no timing
-make bench-run      # measures; run alone on an idle machine
+make bench-build            # builds only; no timing
+make bench-run              # measures; run alone on an idle machine
+make bench-zlib-ng-compat   # builds the ZLIB_COMPAT backend under .build
 ```
 
-`make bench-run` writes `.build/benchmark.json` with the provenance block
-(compiler revision, zlib version, libdeflate version, compiler, platform, CPU,
-Python version), the input manifest, and every row with its raw samples.
+`make bench-run` writes `.build/benchmark.json` with the provenance block, the
+input manifest, every row with its sorted samples, the paired ratios, and a
+sibling `.observations.jsonl` with every observation in acquisition order.
 
 Do not run two measurements at once, and do not run one while a build or a test
 suite is running. The numbers are only comparable within one machine and one
@@ -84,8 +272,16 @@ idle state.
 
 ## What the numbers will not support
 
-- No cross-library speed ranking. The rows differ in bounds, allocation and
-  error handling.
+- No universal "fastest" claim. zlib-ng is 4.3x faster than this library on
+  every input measured here, and it is a drop-in backend rather than a
+  competitor: the honest statement is that this library is 4.3x slower than the
+  backend it could be using.
+- No claim that the step-size change is a general win. It is 2.0x at 1 KiB with
+  headroom and 2.9% slower at 1 KiB with an exact budget.
 - No claim about throughput on a stream larger than 8 MiB.
-- No claim about a different zlib or libdeflate build.
-- No claim about the error path relative to any other library.
+- No claim about a different zlib, zlib-ng or libdeflate build, or a different
+  CPU. The hybrid core layout is part of the result.
+- No claim about the error path relative to any other library: the invalid rows
+  have no equal-contract competitor.
+- No claim that the 1 KiB headroom runs meet the contention gate. They do not,
+  and they are labelled.
