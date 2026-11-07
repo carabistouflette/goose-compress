@@ -5,8 +5,10 @@
 #define _POSIX_C_SOURCE 200809L
 #include "compress.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <zlib.h>
 
 static int failures;
@@ -328,6 +330,43 @@ static void test_abi(void) {
     check(gc_version(tiny, version_view) == GC_LIMIT, "abi: a short buffer is a limit");
 }
 
+/* zlib takes uInt for avail_in, so the adapter clamps a longer slice to
+ * UINT_MAX. The documented contract cannot produce one -- limits.input_bytes is
+ * capped at 1 GiB and the output step at 64 KiB -- so this is a defensive
+ * clamp, and it is tested here because the C entry point is the only place it
+ * can be reached.
+ *
+ * The test is observable: a 44-byte gzip stream sits at the start of a
+ * 4 GiB + 10 byte mapping. Clamped, avail_in is UINT_MAX and the stream ends.
+ * Unclamped, (uInt)(2^32 + 10) is 10, the stream is cut short and zlib reports
+ * Z_BUF_ERROR instead of Z_STREAM_END. */
+static void test_long_slice_clamp(void) {
+    static const uint8_t payload[] = "clamp";
+    uint8_t stream[128];
+    int64_t gzip_len = build_gzip(stream, payload, sizeof payload - 1);
+    int64_t span = (int64_t)UINT_MAX + 11;
+    uint8_t *mapping = mmap(NULL, (size_t)span, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (mapping == MAP_FAILED) {
+        fprintf(stderr, "driver: skipped the long-slice clamp check: "
+                        "mmap of %lld bytes failed\n", (long long)span);
+        return;
+    }
+    memcpy(mapping, stream, (size_t)gzip_len);
+    uint8_t output[128];
+    int64_t meta[6];
+    int64_t handle = open_format(GC_GZIP);
+    check(handle != 0, "clamp: open");
+    int64_t status = feed(handle, mapping, span, output, sizeof output, meta);
+    check(status == GC_OK && meta[3] == 1,
+          "clamp: a slice longer than UINT_MAX still reaches the stream end");
+    check(meta[1] == (int64_t)sizeof payload - 1, "clamp: the payload decoded");
+    int64_t close_meta[1] = {0};
+    gc_meta close_view = {close_meta, 1};
+    check(gc_close(handle, close_view) == GC_OK, "clamp: close");
+    munmap(mapping, (size_t)span);
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || strcmp(argv[1], "--selftest") != 0) {
         fprintf(stderr, "usage: %s --selftest\n", argv[0]);
@@ -339,6 +378,7 @@ int main(int argc, char **argv) {
     test_reset();
     test_slots();
     test_abi();
+    test_long_slice_clamp();
     if (failures) {
         fprintf(stderr, "driver: %d of %d checks failed\n", failures, checks);
         return 1;

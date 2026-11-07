@@ -21,7 +21,8 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
            examples/artifact_payload.goose
 
 .PHONY: setup format check fixtures corpus native test sanitize sanitize-negative \
-        bench bench-build bench-plan bench-run baseline baseline-verify clean
+        bench bench-build bench-competitors bench-parity bench-plan bench-run \
+        baseline baseline-verify clean
 
 setup:
 	./scripts/setup-goose.sh
@@ -40,6 +41,7 @@ check:
 	"$(GOOSE)" check tests/differential.goose
 	"$(GOOSE)" check examples/artifact_payload.goose
 	"$(GOOSE)" check bench/bench.goose
+	"$(GOOSE)" check bench/compare/goose_probe.goose
 
 fixtures:
 	python3 scripts/fixtures.py
@@ -92,10 +94,35 @@ bench: bench-build
 bench-build: fixtures
 	mkdir -p .build
 	"$(GOOSE)" build bench/bench.goose --cc $(BENCH_CC) -O2 -o .build/bench
+	"$(GOOSE)" build bench/compare/goose_probe.goose --cc $(BENCH_CC) -O2 \
+		-o .build/goose-probe
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_bounded.c -lz -o .build/zlib-bounded
+	$(BENCH_CC) $(CFLAGS) -O2 -DZB_ZLIB_NG bench/compare/zlib_bounded.c \
+		-lz-ng -o .build/zlib-ng-bounded
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_oneshot.c -lz -o .build/zlib-oneshot
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/libdeflate_oneshot.c -ldeflate \
 		-o .build/libdeflate-oneshot
+
+# The only other Goose decoder in the catalog, fetched at its pinned commit
+# rather than vendored. Network access is required, so this is opt-in and the
+# row is optional in the runner.
+GOOSE_DEFLATE_REVISION ?= 3b1d0d38be908dbb9bc2e26411bfd7449c570147
+bench-competitors:
+	mkdir -p .build/competitors
+	if [ ! -d .build/competitors/goose-deflate ]; then \
+		git clone -q https://github.com/Macho0x/goose-deflate.git \
+			.build/competitors/goose-deflate && \
+		git -C .build/competitors/goose-deflate checkout -q \
+			"$(GOOSE_DEFLATE_REVISION)"; \
+	fi
+	"$(GOOSE)" build bench/compare/goose_deflate_bench.goose --cc $(BENCH_CC) -O2 \
+		-o .build/goose-deflate-bench
+
+# Proves the C reference row implements the same contract as the library before
+# any number from it is used to rank anything.
+bench-parity: bench-build
+	python3 bench/compare/contract_parity.py --goose "$(GOOSE)"
+	./.build/zlib-bounded --clamp-selftest
 
 # Prints the exact commands, the input set and the call count. Times nothing.
 bench-plan: bench-build
