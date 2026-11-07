@@ -117,7 +117,9 @@ int64_t gc_open(int64_t format, gc_meta meta) {
     if (!handle) {
         inflateEnd(&decoder->stream);
         free(decoder);
-        meta.data[0] = GC_LIMIT;
+        /* A full handle table is a fixed system resource, not a caller's
+         * stream budget. The public API promises SystemError here. */
+        meta.data[0] = GC_SYSTEM;
         return 0;
     }
     meta.data[0] = GC_OK;
