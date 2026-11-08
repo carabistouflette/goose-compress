@@ -326,7 +326,7 @@ static void test_slots(void) {
         handles[i] = open_format(GC_RAW);
         if (handles[i] != 0) opened += 1;
     }
-    check(opened > 0 && opened <= 32, "slots: the registry is bounded");
+    check(opened == 32, "slots: the registry holds exactly 32 decoders");
     int64_t meta[2] = {0, 0};
     gc_meta view = {meta, 2};
     check(gc_open(GC_RAW, view) == 0 && meta[0] == GC_SYSTEM,
