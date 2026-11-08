@@ -88,22 +88,28 @@ def library(goose, format_name, path, output_budget, input_budget, chunk,
                 str(input_budget), str(chunk), policy, str(members)])
 
 
-def compare(label, left, right, failures, checks, output_budget):
+def compare(label, left, right, failures, checks, output_budget, input_budget=None):
     """Compares one pair of outcomes and records every disagreement."""
     checks[0] += 1
     for field in ("error", "produced", "members", "trailing", "fnv1a"):
         if left[field] != right[field]:
             failures.append("%s: %s reference=%s library=%s"
                             % (label, field, left[field], right[field]))
-    # docs/api.md: consumed is invariant except when the output budget stopped
-    # the decode. There the contract is produced == output_bytes and
-    # consumed <= input_bytes.
-    if left["error"] == "limit exceeded" and int(left["produced"]) == output_budget:
+    # Independent bounds catch two implementations agreeing on the same error.
+    # Campaign calls always supply both caps; standalone callers can check only
+    # the output cap by omitting input_budget.
+    for name, result in (("reference", left), ("library", right)):
         checks[0] += 1
-        if int(left["produced"]) != output_budget:
-            failures.append("%s: produced %s != output budget %d"
-                            % (label, left["produced"], output_budget))
-    else:
+        if not 0 <= int(result["produced"]) <= output_budget:
+            failures.append("%s: %s output outside budget" % (label, name))
+        if input_budget is not None:
+            checks[0] += 1
+            if not 0 <= int(result["consumed"]) <= input_budget:
+                failures.append("%s: %s input outside budget" % (label, name))
+    # A limit stop at the output cap may consume different input amounts under
+    # different step strategies. A limit can also be an input/member stop, so
+    # do not assert that every limit failure must fill the output cap.
+    if not (left["error"] == "limit_exceeded" and int(left["produced"]) == output_budget):
         checks[0] += 1
         if left["consumed"] != right["consumed"]:
             failures.append("%s: consumed reference=%s library=%s"
@@ -152,7 +158,7 @@ def main():
                               limits["input_bytes"], chunk, policy, members),
                     library(goose, format_name, path, limits["output_bytes"],
                             limits["input_bytes"], chunk, policy, members),
-                    failures, checks, limits["output_bytes"])
+                    failures, checks, limits["output_bytes"], limits["input_bytes"])
             cases += 1
 
         # Output-budget boundaries: zero, exact, one short, one over.
@@ -164,7 +170,7 @@ def main():
                                   limits["input_bytes"], chunk, policy, members),
                         library(goose, format_name, path, budget,
                                 limits["input_bytes"], chunk, policy, members),
-                        failures, checks, budget)
+                        failures, checks, budget, limits["input_bytes"])
                 cases += 1
 
         # Input-budget boundaries: zero, exact, one short, one over.
@@ -178,7 +184,7 @@ def main():
                                   budget, chunk, policy, members),
                         library(goose, format_name, path, limits["output_bytes"],
                                 budget, chunk, policy, members),
-                        failures, checks, limits["output_bytes"])
+                        failures, checks, limits["output_bytes"], budget)
                 cases += 1
 
         # Member and trailing policies, which the documented limits do not
@@ -195,7 +201,7 @@ def main():
                         library(goose, format_name, path, limits["output_bytes"],
                                 limits["input_bytes"], chunk, policy_name,
                                 member_cap),
-                        failures, checks, limits["output_bytes"])
+                        failures, checks, limits["output_bytes"], limits["input_bytes"])
                 cases += 1
 
     # Corrupted streams. The trailer fields are located from the format, not
@@ -235,7 +241,7 @@ def main():
                         library(goose, format_name, path,
                                 limits["output_bytes"], limits["input_bytes"],
                                 65536, policy, members),
-                        failures, checks, limits["output_bytes"])
+                        failures, checks, limits["output_bytes"], limits["input_bytes"])
                 corruption_cases += 1
 
     report = {

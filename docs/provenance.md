@@ -51,8 +51,10 @@ tarball hash before unpacking it.
 The `zng_` comparator row is built the same way, by `make bench-zlib-ng-bounded`,
 because zlib-ng has no ubuntu-24.04 package: a system `-lz-ng` is not a
 reproducible dependency. The original campaign measured the distribution's
-`/usr/lib/libz-ng.so.2.3.3`; the pinned build is the same 2.3.3 source, so the
-row stays comparable, and a runner without the binary reports the row as
+`/usr/lib/libz-ng.so.2.3.3`; the pinned build uses the same codec version but is a different binary.
+The framing/budget contract stays comparable; earlier system-library timings
+do not qualify the new binary. A new campaign must retain its resolved library
+path, hash and build flags separately, and a runner without the binary reports the row as
 skipped rather than reporting a number it did not measure.
 
 ## Measured identities
@@ -158,9 +160,10 @@ decision with its own validation, and is not claimed here.
 
 ## What was not done
 
-- No performance measurement was run. The harness is prepared and its
-  correctness checks were exercised with one iteration each; no timing is
-  recorded anywhere in this repository.
-- No remote publication. No commit was pushed.
+- Historical performance campaigns are recorded in `docs/benchmark.md` and
+  their named raw artifacts. Unsupported concurrency throughput tables were
+  withdrawn as evidence because their raw observations were not retained.
+- The work branch is pushed as draft PR2; integration into main and a release
+  are separate decisions.
 - No change to any other project, to the package catalog, or to any
   coordination metadata.

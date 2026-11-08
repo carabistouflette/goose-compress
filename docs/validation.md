@@ -5,7 +5,8 @@ Everything below was executed on the machine described in
 `eadca409f68210893f366e60d0c2f0dc29a339be`. Commands are given exactly as run.
 `GOOSE` is set to an existing pinned build of that revision, reused read-only.
 
-No performance measurement was run. See [docs/benchmark.md](docs/benchmark.md).
+No new performance measurement was run for this validation follow-up. Historical
+latency campaigns are described in [benchmark.md](benchmark.md).
 
 ## Layers
 
@@ -15,7 +16,7 @@ No performance measurement was run. See [docs/benchmark.md](docs/benchmark.md).
 | Chunking invariance | the same answer under 7 chunk sizes | `tests/boundaries.goose` |
 | API and ownership | lifecycle, invalid limits, terminal failure, cleanup | `tests/api.goose` |
 | Differential | 100,000 generated cases against an independent oracle | `tests/differential.goose` |
-| Native adapter | 119 direct C-level checks | `tests/driver.c` |
+| Native adapter | 130 direct C-level checks (review follow-up driver) | `tests/driver.c` |
 | Concurrency | independent decoders, stale handles, exhaustion, close-while-in-flight | `tests/concurrency.c` |
 | Artefact integrity | fixtures, corpus, oracle and source fingerprint are what they claim | `tests/test_compress.py` |
 | Consumer | the example runs and refuses what it should | `scripts/example_check.py` |
@@ -271,23 +272,12 @@ Every run is bounded by `CONCURRENCY_TIMEOUT` (default 120 s), and the test
 exits non-zero on a `pthread_create`, `pthread_join` or barrier error instead of
 waiting on a barrier that can never be reached.
 
-### Throughput, before and after
+### Historical throughput claim withdrawn
 
-`concurrency --throughput <threads> <iterations> <input.gz> <budget>` decodes
-`8MiB-text` in N threads with one decoder each. The baseline column is the
-archived `c99b049` `native/compress.c` linked against the same test file, so the
-only difference is the library:
-
-| Threads | baseline c99b049 | current |
-| ---: | ---: | ---: |
-| 1 | 122.0 | 125.2 |
-| 2 | 156.3 | 288.6 |
-| 4 | 151.4 | 591.5 |
-| 8 | 145.9 | 927.0 |
-
-The baseline is flat because one global lock serialised every decoder. The
-current build scales to 6.35x at 8 threads; it is not 8x because four of the
-eight cores on this part are slow cores. `docs/benchmark.md` has the protocol.
+The earlier 1 MiB and 8 MiB concurrency figures lack retained raw observations.
+They are not accepted performance evidence and are withdrawn from the current
+API/benchmark summaries. No replacement run is claimed. The concurrency tests,
+close-wait negative control and TSan evidence address correctness separately.
 
 ### The zlib-ng backend, through its compat ABI
 
@@ -382,11 +372,13 @@ example ok: 38 assertions
 `--debug` — and runs both, so the release and debug code paths are both
 exercised.
 
-## Not covered
+## Coverage limits
 
-- **No coverage-guided fuzzing.** There is no `make fuzz` target. The
-  differential corpus is generated, not coverage-guided; a libFuzzer or AFL
-  harness over `feed` would be the next step for the native adapter.
+Concurrency tests and coverage-guided fuzzing are covered: `tests/concurrency.c`
+and `scripts/fuzz.py` exercise the native/Goose paths with explicit negative
+controls. The retained fuzz campaigns record 413887 and 493162 runs with 171
+coverage edges; these are historical runs, not a new follow-up campaign.
+
 - **No sanitizer coverage of the benchmark harness.** `bench/bench.goose` is
   built with `-O2` and no sanitizer. It is a measurement tool, not a library
   entry point, but it is not instrumented.
@@ -412,8 +404,32 @@ exercised.
   unanimous, but the runs are labelled exploratory in `docs/benchmark.md`.
 - **No Windows or macOS.** The adapter uses `pthread_mutex_t` and links `z` and
   `pthread` on Linux only.
-- **No concurrency test.** The handle table is mutex-protected, but no test
-  opens decoders from several threads at once.
 - **No long-running soak.** The largest single stream decoded was 8 MiB.
 - **No adoption.** `goose-artifact` and `goose-archive` were read, not
   modified, and neither calls this library.
+
+## Review follow-up scope
+
+The old 125-check driver and earlier 115/119-check transcripts are historical;
+they are not totals for the new native regression suite. The current driver
+adds five version-string boundary assertions (130 checks when the optional
+large-mapping checks run). `gc_version` now reports the same short-buffer
+status in its return and metadata. Dictionary representation/length validation
+continues before handle lookup: no opposite error-priority contract was specified.
+
+The parity checker previously tested a space-separated error name even though
+both probes emit `limit_exceeded`; its output-stop branch was unreachable and
+contained a tautological assertion. It now checks both outcomes against their
+budgets independently, recognises the emitted token and permits the documented
+consumption difference at output-cap stops. An input/member limit may stop below
+the output cap; that is not a failure to fill it. Synthetic common-mode output/
+input overruns and negative counts must be rejected, even when both probes agree.
+
+The follow-up ran `make format check test`, both GCC and Clang sanitizer
+targets, benchmark builds (not timings), and both zlib/zlib-ng parity runs.
+All exited zero: 130 native checks, 58 concurrency checks, 19 Python tests,
+48 fixtures, 336 chunked runs, 118 contract checks and 100,000 differential
+cases. Each corrected parity run covered 1,081 cases plus 110 corruption cases
+and reported 6,931 checks with no disagreement. Sanitizer negative controls
+confirmed live instrumentation. Ordered commands, complete logs and explicit
+statuses are preserved in the root campaign evidence archive.

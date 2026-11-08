@@ -1,7 +1,8 @@
 # Benchmark
 
-Every number here was measured on one machine, in one session, with the raw
-observations kept. The point of the section is not the ranking: it is that a
+The retained latency campaigns describe one machine across the named runs.
+Their raw observations and provenance are campaign-specific; unsupported
+concurrency throughput figures have been withdrawn as evidence. The point of the section is not the ranking: it is that a
 reader can tell which claim each number supports and which it does not.
 
 ## The machine and the protocol
@@ -191,15 +192,19 @@ uncontended mutex pair is 3% of it.
 
 | Input | exact | headroom |
 | --- | --- | --- |
-| 1 KiB | 1.052 [1.038, 1.083] | 1.087 [1.065, 1.101] |
+| 1 KiB | 1.052 [1.038, 1.083] | 1.101 [1.071, 1.113] |
 | 64 KiB | 1.010 [1.007, 1.015] | 1.014 [1.012, 1.016] |
 | 1 MiB | 1.031 [1.030, 1.034] | 1.034 [1.031, 1.035] |
 | 8 MiB | 1.053 [1.051, 1.055] | 1.053 [1.052, 1.058] |
 
-This is the price of the bounded state machine, the handle table, the budgets
-and the error taxonomy on top of zlib. It is 1–9% depending on size, and it is
-the number to attack next: at 8 MiB the adapter alone is 2% *faster* than the C
-reference, so the 5.3% is the Goose layer.
+These are end-to-end workload comparisons, not isolated language or wrapper
+costs. The Goose loop uses an initial 4 KiB reservation while the C reference
+uses a fixed 64 KiB step. The adapter-only row bypasses the Goose policy loop
+and has its own output/allocation shape. Neither difference may be attributed
+solely to language overhead. The 1 KiB headroom cell is now traced explicitly to
+`benchmark-1kib-headroom.json` (1.1008 [1.0706,1.1134]); the earlier 1.087 cell
+could not be traced to a retained artifact and is withdrawn. That headroom run
+retains its original exploratory contention status.
 
 ### Against zlib-ng through its `ZLIB_COMPAT` ABI
 
@@ -237,22 +242,13 @@ but the run does not meet the gate and is not presented as if it did.
 
 ## Concurrency
 
-`concurrency --throughput <threads> <iterations> <input.gz> <budget>` decodes
-`8MiB-text` in N threads, each with its own decoder, and reports decodes per
-second. The baseline column is the archived `c99b049` `native/compress.c` linked
-against the same test file, so the only difference is the library.
-
-| Threads | baseline c99b049 | current | speedup |
-| ---: | ---: | ---: | ---: |
-| 1 | 122.0 | 125.2 | 1.03x |
-| 2 | 156.3 | 288.6 | 1.85x |
-| 4 | 151.4 | 591.5 | 3.91x |
-| 8 | 145.9 | 927.0 | **6.35x** |
-
-The baseline is flat: a single global lock serialised every decoder, so adding
-threads added contention and nothing else. 8 threads on 8 cores gives 6.35x and
-not 8x because four of those cores are slow cores at 3.7 GHz. This is a
-measurement on this part, not a promise about a different one.
+`concurrency --throughput` remains a tool for future scaling experiments.
+The earlier tables (different 1 MiB and 8 MiB protocols in different documents)
+have no retained raw observations. Their numeric speedup claims are withdrawn;
+the old text remains in Git history. Concurrency correctness is supported by
+the threaded/close-wait tests and sanitizer checks, not by unretained timings.
+A future scaling claim needs ordered raw runs, source/binary/library identities,
+thread/core-class affinity, a fixed protocol and explicit contention limits.
 
 ## Running it
 

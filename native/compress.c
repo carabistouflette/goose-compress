@@ -378,7 +378,10 @@ int64_t gc_version(gc_output out, gc_meta meta) {
     if (out.len < 0 || (out.len > 0 && !out.data)) return GC_INVALID;
     const char *text = zlibVersion();
     size_t n = strlen(text);
-    if ((int64_t)n > out.len) return GC_LIMIT;
+    if ((int64_t)n > out.len) {
+        meta.data[0] = GC_LIMIT;
+        return GC_LIMIT;
+    }
     memcpy(out.data, text, n);
     meta.data[0] = GC_OK;
     return GC_OK;

@@ -95,18 +95,20 @@ been shown to be a better decoder for this package's job. It has been shown to
 be faster at the part of the job that both do. The rows are grouped by which of
 the three guarantees they make, and only rows in the same group are ranked.
 
-### The zlib reference row is a transliteration, not a wrapper
+### The zlib reference row shares the contract, with a different step strategy
 
-`bench/compare/zlib_bounded.c` is a line-by-line transliteration of
-`compress.goose`'s `feed` loop onto `inflate`: the same input budget, the same
-output budget, the same 64 KiB output step, the same one-byte sentinel that
+`bench/compare/zlib_bounded.c` implements the same framing/input/output budget
+contract over `inflate`. Its fixed 64 KiB output step differs from the Goose
+implementation’s 4 KiB first step followed by 64 KiB steps. Both use the same one-byte sentinel that
 distinguishes "budget reached" from "stream ended", the same member and
 trailing policies, and the same status codes. `bench/compare/contract_parity.py`
 drives both through the same 1081 cases and compares status, consumed,
 produced, members and trailing on every one.
 
-Result on all three backends: **1081 cases, 2162 checks, 0 disagreements**, on
-zlib 1.3.2, on zlib-ng 2.3.3 and on zlib 1.4. Three dictionary fixtures are
+The original checker reported **1081 cases, 2162 counters, 0 disagreements** on
+zlib 1.3.2, zlib-ng 2.3.3 and zlib 1.4. Those counters predate the
+error-token/budget-guard correction described in `docs/validation.md`; they
+do not establish that the old output-stop branch executed. Three dictionary fixtures are
 excluded from the parity run and reported as excluded, because the reference row
 does not implement `inflateSetDictionary`; they are covered by
 `tests/contract.goose` instead.
@@ -257,7 +259,7 @@ API: `inflate`/`inflateInit2`/`inflateReset`/`inflateSetDictionary`, with
 
 - **Ownership.** The caller owns the `z_stream` and both buffers. That is the
   same ownership model this package has, which is why the reference row can be
-  a faithful transliteration.
+  a matching framing/budget contract with a different output-step strategy.
 - **Interop.** zlib is the ABI this package already links. zlib-ng is a
   drop-in with a `zng_` prefix and a different `z_stream` layout, so switching
   backends is a rebuild, not a rewrite — but it is a different shared object

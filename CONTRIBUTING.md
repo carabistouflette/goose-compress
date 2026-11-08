@@ -5,10 +5,11 @@ network I/O and trust decisions. Native code stays private and minimal: it owns
 a `z_stream` and reports what zlib did, nothing more. Policy, budgets and the
 state machine belong in `compress.goose`.
 
-Preserve the chunking guarantee. Any change to `feed` must keep the returned
-error, the produced bytes and `progress.consumed` independent of how the caller
-splits its input. `tests/boundaries.goose` is the check; extend it rather than
-weakening it.
+Preserve the documented chunking rules. Error and produced bytes must stay
+independent of input splits. `progress.consumed` is invariant except at an
+output-budget stop, where it describes the input available to the failing step.
+See `docs/api.md` and `tests/boundaries.goose`; extend those checks rather than
+weakening them.
 
 Use focused branches (`feat/...`, `fix/...`, `docs/...`) and Conventional
 Commits: `feat: add ...`, `fix: reject ...`, `test: cover ...`,
@@ -46,7 +47,7 @@ budget. Each has a fixture and a boundary assertion.
 
 `native/compress.c` is the only C in the library. A change there needs:
 
-- `make native` (115 direct C checks) and `make sanitize` with both compilers,
+- `make native` (130 direct C checks when the optional large mapping succeeds) and `make sanitize` with both compilers,
   including the negative control that proves the instrumentation is live;
 - the 100,000-case differential corpus, which runs under the sanitizers too;
 - a note in `docs/design.md` if the change alters a documented decision.

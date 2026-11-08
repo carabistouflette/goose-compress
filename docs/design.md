@@ -11,8 +11,8 @@ integers and byte slices.
 The adapter holds no policy. It does not know about budgets, members, trailing
 bytes, chunking or the state machine. It reports what zlib did — bytes
 consumed, bytes produced, the zlib return code, and whether a member ended —
-and the Goose code decides what that means. `native/compress.c` is 333 lines,
-most of it argument validation and the handle table.
+and the Goose code decides what that means. The native boundary contains
+argument validation, handle lifetime management and zlib calls.
 
 The alternative, a pure-Goose inflater, was rejected: it would be a second
 DEFLATE implementation to audit, and the project's stated goal is bounded
@@ -20,15 +20,22 @@ decoding over a maintained zlib, not a new decompressor.
 
 ## Handle table
 
-`native/compress.c` keeps 32 slots, each holding a `z_stream` pointer and a
-generation counter, behind one `pthread_mutex_t`.
+`native/compress.c` keeps 32 slots with a generation counter. A handle is
+`(generation << 16) | 0x8000 | (index + 1)`: the low 15 bits encode the one-based
+slot, bit 15 is a validity marker, and generation occupies the high bits.
+`find_decoder` rejects invalid markers/indices/generations and retired slots.
+The generation counter is capped at `0x7FFFFFFFFFFF`; a slot reaching that cap
+is retired instead of wrapping.
 
-A handle is `(index << 47) | generation`. `find_decoder` rejects a zero index,
-an index past the table, a zero generation, a slot whose generation does not
-match, and a slot with no decoder. A stale handle from a closed decoder
-therefore fails as `GC_INVALID` instead of dereferencing freed memory. The
-generation counter is capped at `0x7FFFFFFFFFFF`; a slot that reaches the cap
-is retired rather than wrapped, so a handle can never be reused.
+The registry mutex protects lookup, slot retirement and per-decoder reference
+counts. Acquiring a live decoder takes a reference before dropping that lock.
+Each decoder has its own mutex for zlib operations, so independent decoders do
+not hold a global lock across `inflate`. Closing retires the slot/generation
+first, then waits on a condition variable for references to reach zero before
+destroying the decoder mutex and freeing it. Release drops the per-decoder
+mutex before updating the reference count, avoiding reversed lock ordering.
+A new decoder may reuse the retired slot while the old object waits for its
+references; their generation tokens and object lifetimes remain distinct.
 
 The table is a fixed array, so `open` has no allocation of its own beyond the
 `z_stream` and its window. A 33rd concurrent decoder returns `Error.SystemError`:
@@ -43,12 +50,14 @@ this, and `tests/driver.c` asserts the adapter's own status code.
 some room. It reserves
 
 ```
-reserve = min(max(output_bytes - produced, 1), 65536)
+step = 4096 if produced == 0 else 65536
+reserve = min(max(output_bytes - produced, 1), step)
 ```
 
 and passes `out[base .. base + reserve]` to `gc_inflate`. Three cases follow.
 
-- **Room left.** `reserve` is the remaining budget, capped at 64 KiB. zlib
+- **Room left.** `reserve` is the remaining budget, capped at 4 KiB before any output and
+  64 KiB after it. zlib
   fills at most that much, so the budget cannot be overrun.
 - **Budget exhausted, stream still producing.** `reserve` is 1. zlib writes one
   byte, the adapter reports `produced == 1`, and `feed` sees

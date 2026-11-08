@@ -396,6 +396,27 @@ static void test_long_slice_clamp(void) {
     munmap(mapping, (size_t)span);
 }
 
+static void test_version(void) {
+    uint8_t output[64], untouched[64];
+    memset(output, 0xa5, sizeof output);
+    memcpy(untouched, output, sizeof output);
+    int64_t meta[1] = {0};
+    gc_meta view = {meta, 1};
+    size_t length = strlen(zlibVersion());
+    check(length > 0 && length < sizeof output, "version: fixture fits");
+    if (!length || length >= sizeof output) return;
+    gc_output short_output = {output, 0};
+    check(gc_version(short_output, view) == GC_LIMIT && meta[0] == GC_LIMIT,
+          "version: short buffer status channels agree");
+    check(memcmp(output, untouched, sizeof output) == 0,
+          "version: refused buffer unchanged");
+    gc_output exact_output = {output, (int64_t)length};
+    check(gc_version(exact_output, view) == GC_OK && meta[0] == GC_OK,
+          "version: exact buffer status channels agree");
+    check(memcmp(output, zlibVersion(), length) == 0 && output[length] == 0xa5,
+          "version: exact bytes without trailing write");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || strcmp(argv[1], "--selftest") != 0) {
         fprintf(stderr, "usage: %s --selftest\n", argv[0]);
@@ -407,6 +428,7 @@ int main(int argc, char **argv) {
     test_reset();
     test_slots();
     test_abi();
+    test_version();
     test_long_slice_clamp();
     if (failures) {
         fprintf(stderr, "driver: %d of %d checks failed\n", failures, checks);

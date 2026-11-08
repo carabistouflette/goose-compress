@@ -236,9 +236,7 @@ breaks the one-thread-per-decoder rule therefore gets serialised calls rather
 than a use-after-free, but the result is still undefined and still a bug in the
 caller.
 
-Measured on this machine (8 cores, 4 fast and 4 slow, no SMT), 1 MiB text,
-median decodes per second over 5 repetitions of 20 decodes per thread: 1 thread
-1801, 2 threads 3378, 4 threads 6592, 8 threads 9512. Pinned to the four fast
-cores, 4 threads reach 7500 against 2033 for one, and 8 threads do not improve
-on that because there are only four cores. `tests/concurrency.c` asserts the
-correctness half of this; `--throughput` reports the scaling.
+`tests/concurrency.c` checks independent decoders, close/refcount safety and
+cleanup. Its `--throughput` mode can measure scaling, but the earlier published
+throughput figures lacked retained raw observations and are withdrawn as
+performance evidence. No scaling multiplier is established by these tests.

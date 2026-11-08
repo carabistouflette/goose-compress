@@ -33,6 +33,7 @@ int64_t gc_open(int64_t format, gc_meta meta);
 
 /* gc_dictionary: registers the preset dictionary for this decoder. Raw
  * streams take it immediately; zlib streams take it when the stream asks.
+ * Dictionary representation/length is checked before looking up the handle.
  * meta[0] = status. Returns GC_OK or an error. */
 int64_t gc_dictionary(int64_t handle, gc_input dictionary, gc_meta meta);
 
@@ -54,7 +55,9 @@ int64_t gc_close(int64_t handle, gc_meta meta);
  * (z_stream), meta[2] = live decoder slots. Provenance only. */
 int64_t gc_abi(gc_meta meta);
 
-/* gc_version: appends zlib's runtime version string, for provenance. */
+/* gc_version: copies zlib's runtime version string without a NUL terminator.
+ * Returns status and writes the same status to meta[0] when meta is valid.
+ * A short output buffer returns GC_LIMIT without changing that buffer. */
 int64_t gc_version(gc_output out, gc_meta meta);
 
 #endif
