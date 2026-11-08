@@ -36,6 +36,7 @@ shared object, a build under `.build/competitors` (gitignored), or a clone under
 | zlib 1.3.2 | `/usr/lib/libz.so.1.3.2`, hash recorded in each report's `provenance` |
 | zlib 1.4 | tarball SHA-256 `02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584` |
 | zlib-ng 2.3.3 | `/usr/lib/libz-ng.so.2.3.3`; source tarball SHA-256 `f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1` |
+| zlib-ng 2.3.3 `zng_` comparator | `.build/competitors/zlib-ng-native/lib/libz-ng.so`, built from the same pinned tarball by `make bench-zlib-ng-bounded` |
 | zlib-ng `ZLIB_COMPAT` | `.build/competitors/zlib-ng-compat/lib/libz.so.1.3.1.zlib-ng`, SHA-256 `c4b50c20b2c6e1ec57ea57d7f0013612f339b5a4cd10aefa42b21fc67f0680a6` |
 | libdeflate 1.26 | `/usr/lib/libdeflate.so.0` |
 | `Macho0x/goose-deflate` | commit `3b1d0d38be908dbb9bc2e26411bfd7449c570147` |
@@ -46,6 +47,13 @@ installs a `libz.so.1` with zlib's ABI, so the unchanged Goose binary can be run
 on zlib-ng through `LD_LIBRARY_PATH`. Nothing on the system is replaced, and the
 build is reproducible with `make bench-zlib-ng-compat`, which verifies the
 tarball hash before unpacking it.
+
+The `zng_` comparator row is built the same way, by `make bench-zlib-ng-bounded`,
+because zlib-ng has no ubuntu-24.04 package: a system `-lz-ng` is not a
+reproducible dependency. The original campaign measured the distribution's
+`/usr/lib/libz-ng.so.2.3.3`; the pinned build is the same 2.3.3 source, so the
+row stays comparable, and a runner without the binary reports the row as
+skipped rather than reporting a number it did not measure.
 
 ## Measured identities
 

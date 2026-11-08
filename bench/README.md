@@ -28,7 +28,7 @@ bench/
 | goose-compress fresh | bounded, adaptive steps up to 64 KiB | allocated per call | yes |
 | goose-compress tail | bounded: `finish` + `close` after the last byte | reused | yes |
 | zlib bounded | bounded, same framing policy, zlib 1.3.2 | reused | yes |
-| zlib-ng bounded | bounded, same framing policy, zlib-ng 2.3.3 | reused | yes |
+| zlib-ng bounded | bounded, same framing policy, zlib-ng 2.3.3 (opt-in build) | reused | yes |
 | zlib 1.4 bounded | bounded, same framing policy, zlib 1.4 built static | reused | yes |
 | goose-compress baseline c99b049 oneshot | the published baseline binary, unchanged | reused | yes |
 | goose-compress baseline c99b049 stream | the published baseline binary, unchanged | reused | yes |
@@ -57,6 +57,22 @@ GOOSE=/path/to/pinned/goose make bench
 Compiles the four binaries into `.build/` and writes eight valid fixtures plus
 the truncated-stream and bad-checksum inputs to `.build/bench-inputs/`. It
 measures nothing.
+
+`make bench` builds only what the distribution provides: zlib and libdeflate.
+The competitor rows that need a library the distribution does not ship are
+separate opt-in targets, and the runner prints each absent row by name instead
+of dropping it:
+
+```sh
+make bench-zlib-ng-bounded   # zlib-ng 2.3.3 `zng_` API, from the pinned tarball
+make bench-zlib14            # zlib 1.4, built static under .build/competitors
+make bench-competitors       # Macho0x/goose-deflate at its pinned revision
+```
+
+zlib-ng has no ubuntu-24.04 package, so `bench-zlib-ng-bounded` downloads the
+pinned tarball, verifies its SHA-256 and installs it under
+`.build/competitors/zlib-ng-native`; nothing on the system is touched. Without
+it the `zlib-ng bounded whole` row is reported as skipped, not as a result.
 
 ## Plan, without timing
 

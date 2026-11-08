@@ -259,8 +259,15 @@ measurement on this part, not a promise about a different one.
 ```sh
 make bench-build            # builds only; no timing
 make bench-run              # measures; run alone on an idle machine
+make bench-zlib-ng-bounded  # zlib-ng 2.3.3 `zng_` comparator, pinned tarball
 make bench-zlib-ng-compat   # builds the ZLIB_COMPAT backend under .build
 ```
+
+`make bench-build` compiles only what the distribution ships (zlib,
+libdeflate). The zlib-ng comparator is opt-in because zlib-ng has no
+ubuntu-24.04 package; `make bench-zlib-ng-bounded` builds it from the pinned,
+hash-verified tarball under `.build/competitors`, and a run without it reports
+that row as skipped rather than omitting it silently.
 
 `make bench-run` writes `.build/benchmark.json` with the provenance block, the
 input manifest, every row with its sorted samples, the paired ratios, and a

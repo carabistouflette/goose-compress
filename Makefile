@@ -24,7 +24,7 @@ PROGRAMS = tests/spec.goose tests/boundaries.goose tests/api.goose \
         test sanitize sanitize-negative \
         bench bench-build bench-build-ng bench-competitors bench-zlib14 \
         bench-parity bench-plan bench-run native-ng bench-zlib-ng-compat \
-        baseline baseline-verify clean
+        bench-zlib-ng-bounded baseline baseline-verify clean
 
 setup:
 	./scripts/setup-goose.sh
@@ -122,6 +122,14 @@ sanitize-negative:
 
 # Building the benchmark is not a measurement. `bench-run` is, and it is
 # serialised: run it alone, on an idle machine.
+#
+# `bench-build` compiles only what the distribution provides: zlib and
+# libdeflate. Competitor rows that need a library the distribution does not
+# ship are separate opt-in targets (`bench-zlib14`, `bench-zlib-ng-bounded`,
+# `bench-zlib-ng-compat`, `bench-competitors`), and the runner names their
+# absence as a skipped row instead of dropping it. zlib-ng in particular has no
+# ubuntu-24.04 package, so requiring a system `-lz-ng` here made `make bench`
+# fail on a clean runner.
 bench: bench-build
 
 bench-build: fixtures
@@ -130,8 +138,6 @@ bench-build: fixtures
 	"$(GOOSE)" build bench/compare/goose_probe.goose --cc $(BENCH_CC) -O2 \
 		-o .build/goose-probe
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_bounded.c -lz -o .build/zlib-bounded
-	$(BENCH_CC) $(CFLAGS) -O2 -DZB_ZLIB_NG bench/compare/zlib_bounded.c \
-		-lz-ng -o .build/zlib-ng-bounded
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/zlib_oneshot.c -lz -o .build/zlib-oneshot
 	$(BENCH_CC) $(CFLAGS) -O2 bench/compare/libdeflate_oneshot.c -ldeflate \
 		-o .build/libdeflate-oneshot
@@ -207,6 +213,32 @@ ZLIB_NG_TARBALL ?= .build/competitors/zlib-ng-$(ZLIB_NG_VERSION).tar.gz
 ZLIB_NG_SHA256 ?= f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1
 ZLIB_NG_DIR ?= .build/competitors/zlib-ng-$(ZLIB_NG_VERSION)
 ZLIB_NG_COMPAT ?= .build/competitors/zlib-ng-compat
+ZLIB_NG_NATIVE_DIR ?= .build/competitors/zlib-ng-$(ZLIB_NG_VERSION)-native
+ZLIB_NG_NATIVE ?= .build/competitors/zlib-ng-native
+
+# The `zng_` comparator row, built from the same pinned tarball as the compat
+# backend instead of from a system `-lz-ng`. zlib-ng ships no ubuntu-24.04
+# package, so a system dependency here is not reproducible; the tarball is
+# hash-verified and the install prefix stays under .build/competitors. This is
+# opt-in, and the runner reports the row as skipped when the binary is absent.
+bench-zlib-ng-bounded:
+	mkdir -p .build/competitors
+	if [ ! -f "$(ZLIB_NG_TARBALL)" ]; then \
+		curl -fsSL -o "$(ZLIB_NG_TARBALL)" \
+			https://github.com/zlib-ng/zlib-ng/archive/refs/tags/$(ZLIB_NG_VERSION).tar.gz; \
+	fi
+	echo "$(ZLIB_NG_SHA256)  $(ZLIB_NG_TARBALL)" | sha256sum -c -
+	rm -rf "$(ZLIB_NG_NATIVE_DIR)" "$(ZLIB_NG_NATIVE)"
+	mkdir -p "$(ZLIB_NG_NATIVE_DIR)"
+	tar xzf "$(ZLIB_NG_TARBALL)" -C "$(ZLIB_NG_NATIVE_DIR)" --strip-components=1
+	cd "$(ZLIB_NG_NATIVE_DIR)" && ./configure \
+		--prefix="$(CURDIR)/$(ZLIB_NG_NATIVE)" >/dev/null && $(MAKE) -j4 >/dev/null \
+		&& $(MAKE) install >/dev/null
+	$(BENCH_CC) $(CFLAGS) -O2 -DZB_ZLIB_NG -I"$(ZLIB_NG_NATIVE)/include" \
+		bench/compare/zlib_bounded.c -L"$(ZLIB_NG_NATIVE)/lib" -lz-ng \
+		-Wl,-rpath,"$(CURDIR)/$(ZLIB_NG_NATIVE)/lib" -o .build/zlib-ng-bounded
+	./.build/zlib-ng-bounded --clamp-selftest
+	@echo "zng_ backend: $(CURDIR)/$(ZLIB_NG_NATIVE)/lib/libz-ng.so"
 
 bench-zlib-ng-compat:
 	mkdir -p .build/competitors

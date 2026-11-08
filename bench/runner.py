@@ -220,9 +220,11 @@ BINARIES = ["bench", "zlib-bounded", "zlib-ng-bounded", "zlib14-bounded",
             "zlib-oneshot", "libdeflate-oneshot", "goose-deflate-bench",
             "goose-adapter", "goose-adapter-ng"]
 # Rows whose binary is fetched or built by an opt-in target. Their absence is a
-# skipped row, not a broken run.
+# skipped row, not a broken run. `zlib-ng-bounded` is here because zlib-ng has
+# no ubuntu-24.04 package: `make bench-zlib-ng-bounded` builds it from the
+# pinned tarball, and a runner without it names the row as skipped.
 OPTIONAL_BINARIES = {"goose-deflate-bench", "zlib14-bounded",
-                     "goose-adapter-ng"}
+                     "goose-adapter-ng", "zlib-ng-bounded"}
 INVALID_HARNESS = {
     "label": "goose-compress invalid",
     "binary": "bench",
