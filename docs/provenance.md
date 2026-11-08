@@ -10,8 +10,11 @@
 | zlib linked by the library | 1.3.2 (`version_number()` = 10302) |
 | `sizeof(z_stream)` | 112 |
 | libdeflate (benchmark competitor only) | 1.26 |
+| zlib 1.4 (benchmark competitor only) | built static under `.build/competitors/zlib-1.4` |
+| zlib-ng (benchmark competitor and optional backend) | 2.3.3, `zng_` API and a `-DZLIB_COMPAT` build |
 | C compiler | GCC 16.2.1; Clang for sanitizers |
 | Python (oracle, fixtures, corpus) | 3.14.9 |
+| CPU | Intel Core Ultra 7 258V, 8 cores, hybrid, no SMT |
 
 `GOOSE_REVISION` holds the compiler commit. `compress.build` holds a SHA-256
 over `scripts/native-manifest.py` and every file under `native/`, so a change
@@ -21,6 +24,53 @@ regenerates it; `make check` fails when it is stale.
 The compiler binary was reused, not rebuilt. It was verified to report the
 pinned revision before use, and it was not modified. No concurrent build was
 started.
+
+## Competitor identities
+
+Nothing from another project is vendored. Each competitor is either a system
+shared object, a build under `.build/competitors` (gitignored), or a clone under
+`/tmp`, and each is pinned by hash or by commit:
+
+| Item | Identity |
+| --- | --- |
+| zlib 1.3.2 | `/usr/lib/libz.so.1.3.2`, hash recorded in each report's `provenance` |
+| zlib 1.4 | tarball SHA-256 `02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584` |
+| zlib-ng 2.3.3 | `/usr/lib/libz-ng.so.2.3.3`; source tarball SHA-256 `f9c65aa9c852eb8255b636fd9f07ce1c406f061ec19a2e7d508b318ca0c907d1` |
+| zlib-ng 2.3.3 `zng_` comparator | `.build/competitors/zlib-ng-native/lib/libz-ng.so`, built from the same pinned tarball by `make bench-zlib-ng-bounded` |
+| zlib-ng `ZLIB_COMPAT` | `.build/competitors/zlib-ng-compat/lib/libz.so.1.3.1.zlib-ng`, SHA-256 `c4b50c20b2c6e1ec57ea57d7f0013612f339b5a4cd10aefa42b21fc67f0680a6` |
+| libdeflate 1.26 | `/usr/lib/libdeflate.so.0` |
+| `Macho0x/goose-deflate` | commit `3b1d0d38be908dbb9bc2e26411bfd7449c570147` |
+| `kaitk/goose-compress` | commit `ebf372eac4638a692ee89eba3204c666c101d7d9` |
+
+The `ZLIB_COMPAT` build is the one that matters for the backend question: it
+installs a `libz.so.1` with zlib's ABI, so the unchanged Goose binary can be run
+on zlib-ng through `LD_LIBRARY_PATH`. Nothing on the system is replaced, and the
+build is reproducible with `make bench-zlib-ng-compat`, which verifies the
+tarball hash before unpacking it.
+
+The `zng_` comparator row is built the same way, by `make bench-zlib-ng-bounded`,
+because zlib-ng has no ubuntu-24.04 package: a system `-lz-ng` is not a
+reproducible dependency. The original campaign measured the distribution's
+`/usr/lib/libz-ng.so.2.3.3`; the pinned build uses the same codec version but is a different binary.
+The framing/budget contract stays comparable; earlier system-library timings
+do not qualify the new binary. A new campaign must retain its resolved library
+path, hash and build flags separately, and a runner without the binary reports the row as
+skipped rather than reporting a number it did not measure.
+
+## Measured identities
+
+The published baseline is `c99b049`, archived at
+`.build/baseline/archive/c99b049-v6` and verified against its 57-entry
+`SHA256SUMS`. Its `variants/release/bench` binary is the OLD row in every
+before/after comparison, and its `sources/` tree is what the concurrency
+baseline binary is built from. Neither is rebuilt or overwritten: a measurement
+that rebuilt the old code would be measuring a different thing.
+
+The raw campaign data lives in `.build/benchmark-*.json` with a sibling
+`.observations.jsonl` per run, and the confirmation campaign in
+`.build/confirm-*.json`. Each report carries the provenance block, the
+contention gate result before and after, and the per-round context-switch
+counters of the timed children.
 
 ## Why this library exists
 
@@ -110,9 +160,10 @@ decision with its own validation, and is not claimed here.
 
 ## What was not done
 
-- No performance measurement was run. The harness is prepared and its
-  correctness checks were exercised with one iteration each; no timing is
-  recorded anywhere in this repository.
-- No remote publication. No commit was pushed.
+- Historical performance campaigns are recorded in `docs/benchmark.md` and
+  their named raw artifacts. Unsupported concurrency throughput tables were
+  withdrawn as evidence because their raw observations were not retained.
+- The work branch is pushed as draft PR2; integration into main and a release
+  are separate decisions.
 - No change to any other project, to the package catalog, or to any
   coordination metadata.

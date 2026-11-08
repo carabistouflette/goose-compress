@@ -5,8 +5,10 @@
 #define _POSIX_C_SOURCE 200809L
 #include "compress.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <zlib.h>
 
 static int failures;
@@ -134,7 +136,14 @@ static void test_inflate(void) {
           "inflate: a short meta is invalid");
     check(gc_close(handle, close_view) == GC_OK, "inflate: close after refusals");
 
-    /* A corrupted trailer is a checksum failure, not a malformed stream. */
+    /* A corrupted trailer is a checksum failure, not a malformed stream.
+     *
+     * The adapter decides this from zlib's message text, which is a property of
+     * the linked zlib rather than of the format. All three trailer kinds are
+     * therefore asserted here, on whichever backend this binary was built
+     * against: `make native` checks zlib, `make native-ng` checks zlib-ng. A
+     * backend that words the message differently fails this test instead of
+     * silently reclassifying a bad checksum as malformed data. */
     uint8_t broken[256];
     memcpy(broken, stream, (size_t)gzip_len);
     broken[gzip_len - 8] ^= 0xff;
@@ -143,6 +152,28 @@ static void test_inflate(void) {
     check(status == GC_CHECKSUM, "inflate: a bad CRC is a checksum failure");
     check(meta[1] == (int64_t)payload_len, "inflate: the payload survives the bad CRC");
     check(gc_close(handle, close_view) == GC_OK, "inflate: close after a checksum failure");
+
+    /* The gzip ISIZE field, which zlib reports with its own message. */
+    memcpy(broken, stream, (size_t)gzip_len);
+    broken[gzip_len - 4] ^= 0xff;
+    handle = open_format(GC_GZIP);
+    status = feed(handle, broken, gzip_len, output, sizeof output, meta);
+    check(status == GC_CHECKSUM, "inflate: a bad ISIZE is a checksum failure");
+    check(meta[1] == (int64_t)payload_len, "inflate: the payload survives the bad ISIZE");
+    check(gc_close(handle, close_view) == GC_OK, "inflate: close after a bad ISIZE");
+
+    /* The zlib adler32, which is a different code path in zlib again. The
+     * zlib-format stream goes in its own buffer so the gzip stream above stays
+     * intact for the truncation case below. */
+    uint8_t zstream[256];
+    int64_t adler_stream_len = build_zlib(zstream, payload, payload_len);
+    memcpy(broken, zstream, (size_t)adler_stream_len);
+    broken[adler_stream_len - 1] ^= 0xff;
+    handle = open_format(GC_ZLIB);
+    status = feed(handle, broken, adler_stream_len, output, sizeof output, meta);
+    check(status == GC_CHECKSUM, "inflate: a bad adler32 is a checksum failure");
+    check(meta[1] == (int64_t)payload_len, "inflate: the payload survives the bad adler32");
+    check(gc_close(handle, close_view) == GC_OK, "inflate: close after a bad adler32");
 
     /* An invalid block type is malformed. */
     static const uint8_t bad_block[] = {0x07, 0x00};
@@ -299,7 +330,7 @@ static void test_slots(void) {
     int64_t meta[2] = {0, 0};
     gc_meta view = {meta, 2};
     check(gc_open(GC_RAW, view) == 0 && meta[0] == GC_SYSTEM,
-          "slots: exhaustion is a system resource error");
+          "slots: exhaustion is a system error, not a stream limit");
     int64_t close_meta[1] = {0};
     gc_meta close_view = {close_meta, 1};
     for (int i = 0; i < 64; ++i) {
@@ -328,6 +359,64 @@ static void test_abi(void) {
     check(gc_version(tiny, version_view) == GC_LIMIT, "abi: a short buffer is a limit");
 }
 
+/* zlib takes uInt for avail_in, so the adapter clamps a longer slice to
+ * UINT_MAX. The documented contract cannot produce one -- limits.input_bytes is
+ * capped at 1 GiB and the output step at 64 KiB -- so this is a defensive
+ * clamp, and it is tested here because the C entry point is the only place it
+ * can be reached.
+ *
+ * The test is observable: a 44-byte gzip stream sits at the start of a
+ * 4 GiB + 10 byte mapping. Clamped, avail_in is UINT_MAX and the stream ends.
+ * Unclamped, (uInt)(2^32 + 10) is 10, the stream is cut short and zlib reports
+ * Z_BUF_ERROR instead of Z_STREAM_END. */
+static void test_long_slice_clamp(void) {
+    static const uint8_t payload[] = "clamp";
+    uint8_t stream[128];
+    int64_t gzip_len = build_gzip(stream, payload, sizeof payload - 1);
+    int64_t span = (int64_t)UINT_MAX + 11;
+    uint8_t *mapping = mmap(NULL, (size_t)span, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (mapping == MAP_FAILED) {
+        fprintf(stderr, "driver: skipped the long-slice clamp check: "
+                        "mmap of %lld bytes failed\n", (long long)span);
+        return;
+    }
+    memcpy(mapping, stream, (size_t)gzip_len);
+    uint8_t output[128];
+    int64_t meta[6];
+    int64_t handle = open_format(GC_GZIP);
+    check(handle != 0, "clamp: open");
+    int64_t status = feed(handle, mapping, span, output, sizeof output, meta);
+    check(status == GC_OK && meta[3] == 1,
+          "clamp: a slice longer than UINT_MAX still reaches the stream end");
+    check(meta[1] == (int64_t)sizeof payload - 1, "clamp: the payload decoded");
+    int64_t close_meta[1] = {0};
+    gc_meta close_view = {close_meta, 1};
+    check(gc_close(handle, close_view) == GC_OK, "clamp: close");
+    munmap(mapping, (size_t)span);
+}
+
+static void test_version(void) {
+    uint8_t output[64], untouched[64];
+    memset(output, 0xa5, sizeof output);
+    memcpy(untouched, output, sizeof output);
+    int64_t meta[1] = {0};
+    gc_meta view = {meta, 1};
+    size_t length = strlen(zlibVersion());
+    check(length > 0 && length < sizeof output, "version: fixture fits");
+    if (!length || length >= sizeof output) return;
+    gc_output short_output = {output, 0};
+    check(gc_version(short_output, view) == GC_LIMIT && meta[0] == GC_LIMIT,
+          "version: short buffer status channels agree");
+    check(memcmp(output, untouched, sizeof output) == 0,
+          "version: refused buffer unchanged");
+    gc_output exact_output = {output, (int64_t)length};
+    check(gc_version(exact_output, view) == GC_OK && meta[0] == GC_OK,
+          "version: exact buffer status channels agree");
+    check(memcmp(output, zlibVersion(), length) == 0 && output[length] == 0xa5,
+          "version: exact bytes without trailing write");
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || strcmp(argv[1], "--selftest") != 0) {
         fprintf(stderr, "usage: %s --selftest\n", argv[0]);
@@ -339,6 +428,8 @@ int main(int argc, char **argv) {
     test_reset();
     test_slots();
     test_abi();
+    test_version();
+    test_long_slice_clamp();
     if (failures) {
         fprintf(stderr, "driver: %d of %d checks failed\n", failures, checks);
         return 1;

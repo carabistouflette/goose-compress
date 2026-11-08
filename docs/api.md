@@ -116,7 +116,10 @@ Consumes all of `input` and appends decoded bytes to `out`.
   `Malformed` failure reports the prefix it managed to decode. The caller
   decides whether to keep them.
 - `out` grows by at most 65,536 bytes per internal step, and never beyond
-  `limits.output_bytes` in total.
+  `limits.output_bytes` in total. The first step of a decode is 4,096 bytes and
+  every step after it is the full 65,536, so a small stream is not charged a
+  64 KiB zero-fill per call and a large one reaches the full chunk after one
+  step. The bound above is the maximum, not the constant.
 
 ### `finish(decoder) -> Error`
 
@@ -175,10 +178,28 @@ Stable lowercase names, used by the tests and the example.
 
 ## The chunking guarantee
 
-For a fixed `Limits`, the returned error, the produced bytes and
-`progress.consumed` do not depend on how the caller splits its input into
+For a fixed `Limits`, the returned error, the produced bytes, `progress.members`
+and `progress.trailing` do not depend on how the caller splits its input into
 `feed` calls. `tests/boundaries.goose` asserts this for chunk sizes 1, 2, 3, 7,
 64, 1024 and 65536 over all 48 fixtures, plus the exact-boundary and zero cases.
+
+`progress.consumed` is invariant under the same split **except in one case**:
+when the call stops with `Error.LimitExceeded` because `limits.output_bytes` was
+reached. There `consumed` reports the input the failing step had available, so
+it varies with the chunking. This is not a defect that can be fixed in the
+runtime: `feed` cannot know how many compressed bytes produce exactly the
+remaining output without decoding them, and decoding them would append bytes
+past the budget. The exact rule, asserted by `tests/contract.goose`, is:
+
+- `produced == limits.output_bytes` exactly, and
+- `consumed <= limits.input_bytes` and `consumed <= input.len`.
+
+Everywhere else — including the input-budget stop, a malformed stream, a
+trailing-data refusal and a clean end — `consumed` is identical for every
+chunking. Measured on the 44-byte `gzip-text` fixture with a 168-byte payload:
+`consumed` is 12..13 at `output_bytes = 0`, 13..14 at 1, 16..17 at 4, 28..29 at
+16, and a stable 35 at 64 and 100, while the error, the produced bytes, the
+member count and the trailing count stay fixed throughout.
 
 Two consequences are worth stating because they are easy to get wrong:
 
@@ -196,7 +217,7 @@ Two consequences are worth stating because they are easy to get wrong:
 | --- | --- |
 | Native state per decoder | one `z_stream`, about 40 KiB, fixed |
 | Open decoders | 32, then `Error.SystemError` |
-| Output per `feed` step | 65,536 bytes |
+| Output per `feed` step | 65,536 bytes maximum; 4,096 on the first step of a decode |
 | Output per decoder | `limits.output_bytes`, at most 1 GiB |
 | Input per decoder | `limits.input_bytes`, at most 1 GiB |
 | Dictionary | 32,768 bytes |
@@ -205,5 +226,17 @@ Two consequences are worth stating because they are easy to get wrong:
 ## Concurrency
 
 One decoder is not safe to use from two threads at once. Separate decoders are
-independent; the handle table is mutex-protected, so `open` and `close` from
-different threads are safe.
+independent, and they run at the same time: the registry lock is held only for a
+handle lookup and a reference release, never across `inflate`, and each decoder
+carries its own mutex. `open` and `close` from different threads are safe.
+
+`close` retires the handle first, so a lookup on it fails immediately, and then
+waits for any call already inside that decoder before it frees. A caller that
+breaks the one-thread-per-decoder rule therefore gets serialised calls rather
+than a use-after-free, but the result is still undefined and still a bug in the
+caller.
+
+`tests/concurrency.c` checks independent decoders, close/refcount safety and
+cleanup. Its `--throughput` mode can measure scaling, but the earlier published
+throughput figures lacked retained raw observations and are withdrawn as
+performance evidence. No scaling multiplier is established by these tests.

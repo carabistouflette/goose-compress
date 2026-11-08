@@ -5,7 +5,8 @@ Everything below was executed on the machine described in
 `eadca409f68210893f366e60d0c2f0dc29a339be`. Commands are given exactly as run.
 `GOOSE` is set to an existing pinned build of that revision, reused read-only.
 
-No performance measurement was run. See [docs/benchmark.md](docs/benchmark.md).
+No new performance measurement was run for this validation follow-up. Historical
+latency campaigns are described in [benchmark.md](benchmark.md).
 
 ## Layers
 
@@ -15,10 +16,12 @@ No performance measurement was run. See [docs/benchmark.md](docs/benchmark.md).
 | Chunking invariance | the same answer under 7 chunk sizes | `tests/boundaries.goose` |
 | API and ownership | lifecycle, invalid limits, terminal failure, cleanup | `tests/api.goose` |
 | Differential | 100,000 generated cases against an independent oracle | `tests/differential.goose` |
-| Native adapter | 115 direct C-level checks | `tests/driver.c` |
+| Native adapter | 130 direct C-level checks (review follow-up driver) | `tests/driver.c` |
+| Concurrency | independent decoders, stale handles, exhaustion, close-while-in-flight | `tests/concurrency.c` |
 | Artefact integrity | fixtures, corpus, oracle and source fingerprint are what they claim | `tests/test_compress.py` |
 | Consumer | the example runs and refuses what it should | `scripts/example_check.py` |
 | Sanitizers | ASan and UBSan clean, no leaks, instrumentation proven live | `make sanitize` |
+| ThreadSanitizer | the registry refcount and the per-decoder lock are race-free | `make concurrency-tsan` |
 
 ## Fixtures
 
@@ -125,8 +128,27 @@ generation cap, dictionary installation, reset behaviour and the ABI report.
 ```
 $ make native
 ./.build/driver --selftest
-driver ok: 115 checks
+driver ok: 125 checks
 ```
+
+The checksum classification is asserted on all three trailer kinds — the gzip
+CRC32, the gzip ISIZE and the zlib adler32 — because the adapter decides
+`Error.Checksum` from zlib's message text, and that text belongs to the linked
+zlib rather than to the format. `make native-ng` runs the same 125 checks
+against zlib-ng, so a backend that words the message differently fails here
+instead of silently reclassifying a bad checksum as malformed data.
+
+```
+$ make native-ng WRAP_INFLATE=zng_inflate
+./.build/driver-ng --selftest
+driver ok: 125 checks
+timeout 120 ./.build/concurrency-ng --selftest
+concurrency ok: 58 checks
+```
+
+`WRAP_INFLATE` exists because `--wrap=inflate` does not intercept `zng_inflate`:
+the close-race test wraps the symbol the adapter actually calls, and the test
+pastes the name from the same header the adapter uses.
 
 ## Sanitizers
 
@@ -143,13 +165,16 @@ SANITIZER_CC=clang ./scripts/sanitizer-cc.sh -O1 -g -Inative \
     -lz -lpthread -lm -ldl
 ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
     ./.build/driver-sanitize --selftest
-driver ok: 115 checks
+driver ok: 119 checks
+concurrency ok: 58 checks
 sanitize: spec
 spec ok: 48 fixtures
 sanitize: boundaries
 boundaries ok: 336 chunked runs
 sanitize: api
 api ok
+sanitize: contract
+contract ok: 118 checks
 sanitize: differential
 differential ok: 100000 cases
 checking goose translation unit with clang
@@ -190,6 +215,94 @@ last step of `make sanitize`:
 
 Both checks build into `.build/negative/` and leave the repository untouched.
 `make sanitize-negative` runs them alone.
+
+## Concurrency
+
+`tests/concurrency.c` checks the half of the contract that says separate
+decoders are independent, and the lifetime rule that makes `close` safe while
+another thread is inside a decoder.
+
+```
+$ make concurrency
+cc -std=c11 -Wall -Wextra -Werror -O2 -Inative tests/concurrency.c \
+    native/compress.c -lz -lpthread -DGC_TEST_WRAP_INFLATE \
+    -Wl,--wrap=inflate -o .build/concurrency
+timeout 120 ./.build/concurrency --selftest
+concurrency ok: 58 checks
+```
+
+The checks are: eight threads decoding eight independent streams produce the
+right bytes and leave no slot open; a handle closed by one thread is rejected
+by another; a full table reports `Error.SystemError` and a freed slot is
+reusable; 8 × 500 open/close rounds leave the table empty; and a close that
+starts while a decode is genuinely inside `inflate` waits for it.
+
+That last one is the one that cannot be established by sleeping. The test
+binary is linked with `-Wl,--wrap=inflate`, and the wrapper posts a semaphore
+before it calls the real `inflate` and waits for a second one, so the decode is
+provably in flight with a reference held. The test then starts the close,
+spins until `gc_abi` reports the slot retired, and asserts that the close has
+not returned, that a lookup on the retired handle is refused, and that the slot
+is reusable afterwards. The wrap lives in the test binary only; the library is
+unchanged.
+
+The check is not vacuous. Removing the `while (decoder->refs > 0)
+pthread_cond_wait(...)` line from `gc_close` and rebuilding the same test under
+ASan produces:
+
+```
+==ERROR: AddressSanitizer: heap-use-after-free on address ...
+READ of size 4 at ... thread T19
+    #0 gc_inflate .../compress.c:275
+    #1 race_inflate_worker .../tests/concurrency.c:328
+freed by thread T20 here:
+    #0 free
+    #1 gc_close .../compress.c:339
+```
+
+so the wait is what stands between the test and a use-after-free.
+
+`make concurrency-tsan` builds the same test with `-fsanitize=thread` and runs
+it under `TSAN_OPTIONS=halt_on_error=1`; it reports `concurrency ok: 58 checks`
+with no race. ThreadSanitizer is the only tool here that sees the registry
+refcount and the per-decoder lock, so it is a separate target rather than part
+of `make sanitize`.
+
+Every run is bounded by `CONCURRENCY_TIMEOUT` (default 120 s), and the test
+exits non-zero on a `pthread_create`, `pthread_join` or barrier error instead of
+waiting on a barrier that can never be reached.
+
+### Historical throughput claim withdrawn
+
+The earlier 1 MiB and 8 MiB concurrency figures lack retained raw observations.
+They are not accepted performance evidence and are withdrawn from the current
+API/benchmark summaries. No replacement run is claimed. The concurrency tests,
+close-wait negative control and TSan evidence address correctness separately.
+
+### The zlib-ng backend, through its compat ABI
+
+zlib-ng built with `-DZLIB_COMPAT` installs a `libz.so.1` with zlib's ABI, so
+the unchanged binary can be run on it. An ABI promise is worth what its
+verification is worth, so the whole suite is re-run against that link:
+
+```
+$ make bench-zlib-ng-compat
+$ export LD_LIBRARY_PATH=$PWD/.build/competitors/zlib-ng-compat/lib
+$ ./.build/driver --selftest
+driver ok: 125 checks
+$ ./.build/concurrency --selftest
+concurrency ok: 58 checks
+$ for t in spec boundaries api contract; do "$GOOSE" run tests/$t.goose; done
+spec ok: 48 fixtures
+boundaries ok: 336 chunked runs
+api ok
+contract ok: 118 checks
+$ make sanitize SANITIZER_CC=gcc
+$ make sanitize SANITIZER_CC=clang
+```
+
+Both sanitizer runs are green with live instrumentation (27 handlers referenced
+under GCC, 29 under Clang) and both negative controls still fire.
 
 ## Resource bounds
 
@@ -241,7 +354,7 @@ python3 scripts/native-manifest.py --check
 $ make test
 wrote 48 fixtures to .build/fixtures
 wrote 100000 cases, 39142465 bytes, sha256 6e729d76...
-driver ok: 115 checks
+driver ok: 125 checks
 spec ok: 48 fixtures
 boundaries ok: 336 chunked runs
 api ok
@@ -259,14 +372,13 @@ example ok: 38 assertions
 `--debug` — and runs both, so the release and debug code paths are both
 exercised.
 
-## Not covered
+## Coverage limits
 
-- **No timing.** The benchmark harness is built and its correctness checks were
-  exercised with a single iteration each, but no measurement was recorded. The
-  measurement is serialised so that no two runs compete for a CPU.
-- **No fuzzing.** There is no `make fuzz` target. The differential corpus is
-  generated, not coverage-guided; a libFuzzer or AFL harness over `feed` would
-  be the next step for the native adapter.
+Concurrency tests and coverage-guided fuzzing are covered: `tests/concurrency.c`
+and `scripts/fuzz.py` exercise the native/Goose paths with explicit negative
+controls. The retained fuzz campaigns record 413887 and 493162 runs with 171
+coverage edges; these are historical runs, not a new follow-up campaign.
+
 - **No sanitizer coverage of the benchmark harness.** `bench/bench.goose` is
   built with `-O2` and no sanitizer. It is a measurement tool, not a library
   entry point, but it is not instrumented.
@@ -275,10 +387,49 @@ exercised.
   is the same `feed`/`finish`/`close` sequence the instrumented tests cover, but
   the example binary itself is not instrumented.
 - **No 32-bit or big-endian build.** Only x86-64 Linux was exercised.
+- **No mutation of the concurrency guarantees.** `scripts/mutation-test.py`
+  mutates the Goose-level contract (budgets, member limit, trailing policy,
+  sticky error, consumed accounting, stale handles, dictionary limit) and kills
+  8 of 8 on a pristine-green tree. The per-decoder lock and the close wait are
+  covered by the ASan negative control and by TSan, not by a mutant.
+- **No TSan run against the zlib-ng backend.** TSan was run against zlib 1.3.2
+  only. The zlib-ng builds were checked with ASan+UBSan and with the full
+  concurrency suite, but not under ThreadSanitizer.
+- **No measurement of the `stream` and `fresh` rows against a competitor.** They
+  are measured and reported, but the equal-contract competitor rows are
+  whole-input, so the incremental rows have no fair opponent.
+- **The 1 KiB headroom runs do not meet the contention gate.** Their endpoint
+  CPU pressure check failed because other work started during the run. The
+  ratio is reproducible across three independent runs and the per-round win is
+  unanimous, but the runs are labelled exploratory in `docs/benchmark.md`.
 - **No Windows or macOS.** The adapter uses `pthread_mutex_t` and links `z` and
   `pthread` on Linux only.
-- **No concurrency test.** The handle table is mutex-protected, but no test
-  opens decoders from several threads at once.
 - **No long-running soak.** The largest single stream decoded was 8 MiB.
 - **No adoption.** `goose-artifact` and `goose-archive` were read, not
   modified, and neither calls this library.
+
+## Review follow-up scope
+
+The old 125-check driver and earlier 115/119-check transcripts are historical;
+they are not totals for the new native regression suite. The current driver
+adds five version-string boundary assertions (130 checks when the optional
+large-mapping checks run). `gc_version` now reports the same short-buffer
+status in its return and metadata. Dictionary representation/length validation
+continues before handle lookup: no opposite error-priority contract was specified.
+
+The parity checker previously tested a space-separated error name even though
+both probes emit `limit_exceeded`; its output-stop branch was unreachable and
+contained a tautological assertion. It now checks both outcomes against their
+budgets independently, recognises the emitted token and permits the documented
+consumption difference at output-cap stops. An input/member limit may stop below
+the output cap; that is not a failure to fill it. Synthetic common-mode output/
+input overruns and negative counts must be rejected, even when both probes agree.
+
+The follow-up ran `make format check test`, both GCC and Clang sanitizer
+targets, benchmark builds (not timings), and both zlib/zlib-ng parity runs.
+All exited zero: 130 native checks, 58 concurrency checks, 19 Python tests,
+48 fixtures, 336 chunked runs, 118 contract checks and 100,000 differential
+cases. Each corrected parity run covered 1,081 cases plus 110 corruption cases
+and reported 6,931 checks with no disagreement. Sanitizer negative controls
+confirmed live instrumentation. Ordered commands, complete logs and explicit
+statuses are preserved in the root campaign evidence archive.

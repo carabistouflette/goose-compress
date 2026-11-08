@@ -69,6 +69,12 @@ extern fn native_version(out: u8[:], meta: i64[:]) -> i64 = "gc_version";
 // of the caller's builder per step, not the stream: the cumulative budget is
 // limits.output_bytes.
 fn chunk_bytes() -> i64 { return 65536; }
+// The smallest room a step offers. `out.resize` zero-fills every byte it adds,
+// so offering the full 64 KiB to a stream that produces 1 KiB writes 64 KiB of
+// zeros for nothing. The step starts here and grows with what the stream has
+// already produced, which reaches the full 64 KiB after a handful of steps on
+// a large stream and never over-allocates on a small one.
+fn min_step_bytes() -> i64 { return 4096; }
 fn max_output_bytes() -> i64 { return 1073741824; }
 fn max_input_bytes() -> i64 { return 1073741824; }
 fn max_members() -> i64 { return 1024; }
@@ -199,7 +205,16 @@ fn feed(decoder: Decoder&, input: const u8[:], out: u8[>..]&) -> Error {
         // A zero budget still needs one byte of room so that a stream which
         // produces nothing can end; a byte that arrives is then over budget.
         let remaining = decoder.limits.output_bytes - decoder.progress.produced;
-        let reserve = min(max(remaining, 1), chunk_bytes());
+        // The first step is small so a tiny stream does not pay for a 64 KiB
+        // zero-fill it will never use. After that the step is the full chunk:
+        // growing it gradually costs one inflate call and one resize per
+        // doubling, which is measurable on a 64 KiB stream and buys nothing.
+        let step = if decoder.progress.produced == 0 {
+            min_step_bytes()
+        } else {
+            chunk_bytes()
+        };
+        let reserve = min(max(remaining, 1), step);
         out.resize(out.len + reserve, 0);
         let base = out.len - reserve;
         var meta: i64[6] = [0, 0, 0, 0, 0, 0];
